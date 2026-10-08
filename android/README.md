@@ -35,6 +35,9 @@ python tools/optimize_models.py --src build/silero-export --out app/src/main/ass
 adb install app/build/outputs/apk/release/app-release.apk
 ```
 
+`-Psilero.abi=x86_64` builds an APK for the x86-64 emulator (smoke tests;
+the release is arm64-v8a only).
+
 The release APK is signed with the debug key unless a keystore is given via
 `SILERO_KEYSTORE`, `SILERO_KEYSTORE_PASSWORD`, `SILERO_KEY_ALIAS`, `SILERO_KEY_PASSWORD`
 (or the `silero.keystore*` Gradle properties). APKs signed with different keys
