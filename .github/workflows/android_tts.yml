@@ -1,0 +1,73 @@
+name: Android TTS APK
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android_tts.yml'
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r tools/requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: android/build/v5_5_ru.pt
+          key: silero-v5_5_ru-package
+
+      - name: Export models to ONNX
+        run: python tools/export_models.py --package build/v5_5_ru.pt --out build/silero-export
+
+      - name: Verify the ONNX pipeline against the original package
+        run: python tools/reference_pipeline.py --assets build/silero-export --compare build/v5_5_ru.pt
+
+      - name: Build APK model assets
+        run: python tools/optimize_models.py --src build/silero-export --out app/src/main/assets/silero
+
+      - name: Write Kotlin test vectors
+        run: python tools/reference_pipeline.py --assets app/src/main/assets/silero --vectors build/vectors.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Engine tests (Kotlin vs reference pipeline)
+        run: ./gradlew :core:test -Psilero.assets=$PWD/app/src/main/assets/silero -Psilero.vectors=$PWD/build/vectors.json
+
+      - name: Release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.SILERO_KEYSTORE_B64 }}
+        if: env.KEYSTORE_B64 != ''
+        run: echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Build APK
+        env:
+          SILERO_KEYSTORE: ${{ runner.temp }}/release.jks
+          SILERO_KEYSTORE_PASSWORD: ${{ secrets.SILERO_KEYSTORE_PASSWORD }}
+          SILERO_KEY_ALIAS: ${{ secrets.SILERO_KEY_ALIAS }}
+          SILERO_KEY_PASSWORD: ${{ secrets.SILERO_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease :app:lintRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero-tts-v5_5_ru-arm64
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error

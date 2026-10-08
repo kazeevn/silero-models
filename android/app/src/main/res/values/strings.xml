@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Silero TTS (ru)</string>
+    <string name="status_loading">Loading models…</string>
+    <string name="status_ready">Ready. Models loaded in %1$d ms, %2$d threads.</string>
+    <string name="status_error">Failed to load models: %1$s</string>
+    <string name="voice">Default voice</string>
+    <string name="sample_rate">Output sample rate</string>
+    <string name="threads">CPU threads</string>
+    <string name="threads_auto">Auto (%1$d performance cores)</string>
+    <string name="stress">Automatic stress</string>
+    <string name="homographs">Resolve homographs (замок / замок)</string>
+    <string name="yo">Restore «ё»</string>
+    <string name="test_text_hint">Text to speak</string>
+    <string name="sample_text">Привет! Я синтезатор речи Silero. Сегодня 8 октября 2026 года, на улице +15°C. Как у вас дела?</string>
+    <string name="speak">Speak</string>
+    <string name="stop">Stop</string>
+    <string name="benchmark">Benchmark</string>
+    <string name="benchmark_running">Benchmarking…</string>
+    <string name="tts_settings">Open system text-to-speech settings</string>
+    <string name="about">Engine: Silero TTS v5_5_ru (CC BY-NC-SA 4.0, silero.ai) running on-device with ONNX Runtime. Text is never sent anywhere.\n\nTo use it system-wide, select this app as the preferred engine in the system text-to-speech settings.</string>
+</resources>

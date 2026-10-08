@@ -1,0 +1,6 @@
+# model export (export_models.py, optimize_models.py, reference_pipeline.py)
+# torch CPU wheels: pip install --index-url https://download.pytorch.org/whl/cpu torch
+torch>=2.5
+numpy
+onnx
+onnxruntime==1.30.0
