@@ -6,10 +6,17 @@ on:
       - 'android/**'
       - '.github/workflows/android_tts.yml'
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish the APK as a GitHub release
+        type: boolean
+        default: false
 
 jobs:
   apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # for the optional GitHub release
     defaults:
       run:
         working-directory: android
@@ -49,6 +56,9 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: Android SDK 37
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" > /dev/null
+
       - name: Engine tests (Kotlin vs reference pipeline)
         run: ./gradlew :core:test -Psilero.assets=$PWD/app/src/main/assets/silero -Psilero.vectors=$PWD/build/vectors.json
 
@@ -71,3 +81,36 @@ jobs:
           name: silero-tts-v5_5_ru-arm64
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+
+      # Created with the workflow token, so the tag does not trigger other
+      # workflows (build_deploy.yml publishes to PyPI on ref creation).
+      - name: Publish GitHub release
+        if: inputs.release || contains(github.event.head_commit.message, '[release]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts)
+          TAG="android-tts-$VERSION"
+          APK="silero-tts-v5_5_ru-arm64-android17.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/$APK"
+          SHA=$(sha256sum "$RUNNER_TEMP/$APK" | cut -d' ' -f1)
+          CERT=$("$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$RUNNER_TEMP/$APK" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1)
+          cat > "$RUNNER_TEMP/notes.md" <<NOTES
+          Offline Android system text-to-speech engine running [Silero](https://github.com/snakers4/silero-models) \`v5_5_ru\` on-device with ONNX Runtime: 5 Russian voices (xenia, baya, kseniya, aidar, eugene), automatic stress and homographs, Russian text normalization.
+
+          Built for a Pixel 8a on Android 17: arm64-v8a only, minSdk 37. See [android/README.md](https://github.com/${{ github.repository }}/blob/$GITHUB_SHA/android/README.md) for details and measurements.
+
+          **Install:** \`adb install $APK\` (or open the file on the phone), then pick *Silero TTS (ru)* in Settings → System → Languages → Text-to-speech output → Preferred engine.
+
+          - APK SHA-256: \`$SHA\`
+          - Signing certificate SHA-256: \`$CERT\`
+
+          The model is licensed under CC BY-NC-SA 4.0 (non-commercial use only).
+          NOTES
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$RUNNER_TEMP/$APK" --clobber
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$TAG" "$RUNNER_TEMP/$APK" --target "$GITHUB_SHA" \
+              --title "Silero TTS v5_5_ru for Android $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi

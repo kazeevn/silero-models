@@ -37,7 +37,12 @@ The release APK is signed with the debug key unless a keystore is given via
 can't update each other; uninstall first.
 
 The `Android TTS APK` GitHub workflow runs all of the above (plus the
-verification steps below) and uploads the APK as a build artifact.
+verification steps below) and uploads the APK as a build artifact. It also
+publishes a GitHub release (tag `android-tts-<versionName>`) when the commit
+message contains `[release]` or when run manually with *release* checked.
+Without the `SILERO_KEYSTORE_B64` / `SILERO_KEYSTORE_PASSWORD` /
+`SILERO_KEY_ALIAS` / `SILERO_KEY_PASSWORD` secrets every run signs with a new
+throwaway key, so installed releases can't be updated in place.
 
 ### Verification
 
