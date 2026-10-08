@@ -5,7 +5,6 @@ import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.View
@@ -30,13 +29,11 @@ class SettingsActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // edge-to-edge is enforced for targetSdk 35+ on Android 15+
-            findViewById<View>(R.id.root).setOnApplyWindowInsetsListener { v, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
-                v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-                insets
-            }
+        // edge-to-edge is mandatory: keep the content clear of system bars and the keyboard
+        findViewById<View>(R.id.root).setOnApplyWindowInsetsListener { v, insets ->
+            val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
         }
         status = findViewById(R.id.status)
         result = findViewById(R.id.result)

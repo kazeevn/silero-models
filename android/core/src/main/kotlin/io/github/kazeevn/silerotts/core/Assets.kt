@@ -31,13 +31,8 @@ class DirectoryAssetSource(private val dir: File) : AssetSource {
 
 internal fun ByteBuffer.littleEndian(): ByteBuffer = duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
-/** Little-endian view of `length` bytes at absolute `offset` (ByteBuffer.slice(int, int) needs API 34). */
-internal fun ByteBuffer.sliceAt(offset: Int, length: Int): ByteBuffer {
-    val d = duplicate()
-    d.limit(offset + length)
-    d.position(offset)
-    return d.slice().order(ByteOrder.LITTLE_ENDIAN)
-}
+/** Little-endian view of `length` bytes at absolute `offset`. */
+internal fun ByteBuffer.sliceAt(offset: Int, length: Int): ByteBuffer = slice(offset, length).order(ByteOrder.LITTLE_ENDIAN)
 
 /** Constants exported to config.json. */
 class ModelConfig(json: Map<String, Any?>) {

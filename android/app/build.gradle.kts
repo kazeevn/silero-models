@@ -1,21 +1,21 @@
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-
 plugins {
+    // Kotlin is compiled by AGP's built-in Kotlin support
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 val modelAssets = file("src/main/assets/silero")
 
 android {
     namespace = "io.github.kazeevn.silerotts"
-    compileSdk = 36
+    compileSdk {
+        version = release(37)
+    }
 
     defaultConfig {
         applicationId = "io.github.kazeevn.silerotts"
-        // Pixel 8a ships with Android 14; nothing below 10 is needed for arm64 phones
-        minSdk = 29
-        targetSdk = 36
+        // built for a Pixel 8a running Android 17
+        minSdk = 37
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0.0-v5_5_ru"
         // Tensor G3 is arm64-only; dropping the other ABIs of ONNX Runtime saves ~100 MB
@@ -71,10 +71,6 @@ android {
         // the model assets are generated outside of Gradle
         disable += "MissingTranslation"
     }
-}
-
-kotlin {
-    compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
 }
 
 dependencies {

@@ -26,7 +26,7 @@ pip install -r tools/requirements.txt
 python tools/export_models.py --package v5_5_ru.pt --out build/silero-export
 # 2. build the APK assets
 python tools/optimize_models.py --src build/silero-export --out app/src/main/assets/silero
-# 3. build the APK (Android SDK 36, JDK 17+)
+# 3. build the APK (Android SDK 37, JDK 17+)
 ./gradlew :app:assembleRelease
 adb install app/build/outputs/apk/release/app-release.apk
 ```
@@ -83,7 +83,7 @@ with Python glue. Nothing of it runs on Android as is, so:
 | **Model size** | 130 MB fp32 → 67 MB: weights stored as fp16 with a `Cast` that ONNX Runtime constant-folds at load, so inference runs on the fp32 NEON kernels at full speed and quality (PESQ-wb vs fp32 4.63, where 4.64 = identical). BERT vocabulary pruned to the 51.8k wordpieces the frontend can produce (lossless); positional encodings computed in-graph; a dead decoder layer whose output was discarded removed. |
 | **Quantization** | Measured and rejected: int8 activations (dynamic int8, `MatMulNBits` accuracy level 4) cost 0.3–0.6 PESQ on the male voices, 4-bit ~0.9. |
 | **Memory / load** | Models and lookup tables are stored uncompressed in the APK and memory-mapped (`createSession(ByteBuffer)`, n-gram/vocab hash tables read in place): no extraction, no Java heap copies, no parsing of the 126k n-grams. `libonnxruntime.so` is page-aligned (16 KB) and loaded from the APK. |
-| **ABI** | arm64-v8a only (Tensor G3), dropping ~100 MB of other ABIs. |
+| **Target** | Android 17 (API 37) only, arm64-v8a only (Tensor G3): no compatibility code, ~100 MB of other ABIs dropped. |
 | **Threads** | ONNX Runtime uses one thread per performance core, detected from cpufreq (Pixel 8a: 4× Cortex-A715 + 1× Cortex-X3, the A510 little cores are skipped); spin-waiting is disabled because synthesis is throttled by playback. Adjustable in the settings. |
 | **Latency** | Text is split into sentences and the vocoder runs in windows (48 frames first, then 256) with 28 frames of context, which covers its receptive field exactly, so the first 0.6 s of audio is played while the rest is still being generated, with output identical to a single pass. |
 | **Fast speech** | Speech rate scales the predicted durations like the original SSML `prosody rate`, but keeps at least one frame per sound so screen-reader speeds don't drop phonemes. |

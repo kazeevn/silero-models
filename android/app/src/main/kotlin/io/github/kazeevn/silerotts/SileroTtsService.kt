@@ -57,7 +57,7 @@ class SileroTtsService : TextToSpeechService() {
 
     override fun onSynthesizeText(request: SynthesisRequest, callback: SynthesisCallback) {
         stopped = false
-        val text = request.charSequenceText?.toString() ?: request.text ?: ""
+        val text = request.charSequenceText?.toString().orEmpty()
         if (!isRussian(request.language) && request.voiceName.isNullOrEmpty()) {
             callback.error(TextToSpeech.ERROR_INVALID_REQUEST)
             return
@@ -107,7 +107,7 @@ class SileroTtsService : TextToSpeechService() {
     companion object {
         private const val TAG = "SileroTts"
         val SPEAKERS = listOf("xenia", "baya", "kseniya", "aidar", "eugene")
-        private val LOCALE = Locale("ru", "RU")
+        private val LOCALE = Locale.forLanguageTag("ru-RU")
 
         fun voiceName(speaker: String) = "ru-RU-x-silero-$speaker"
 
