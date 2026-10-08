@@ -1,9 +1,7 @@
 package io.github.kazeevn.silerotts.core
 
-import ai.onnxruntime.OnnxTensor
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtSession
-import java.nio.LongBuffer
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 
 /** Port of `custom_tokenizers/bert_tokenizer.py` (no lower-casing, no accent stripping). */
 class BertTokenizer(private val vocab: StringHashTable, private val ids: ModelConfig.BertIds) {
@@ -101,15 +99,64 @@ class BertTokenizer(private val vocab: StringHashTable, private val ids: ModelCo
     }
 }
 
+/**
+ * int8 BERT word embeddings (bert_emb.bin), read in place from the mapped
+ * asset. Rows are de-quantized exactly like the original package does.
+ */
+class BertEmbeddings(buffer: ByteBuffer) {
+    private val data = buffer.littleEndian()
+    val dim: Int
+    private val rows: Int
+    private val scale: Float
+    private val zeroPoint: Float
+
+    init {
+        val magic = ByteArray(4).also { data.get(it) }
+        require(String(magic, StandardCharsets.US_ASCII) == "BEM1") { "not a BEM1 file" }
+        rows = data.getInt()
+        dim = data.getInt()
+        scale = data.getFloat()
+        zeroPoint = data.getFloat()
+    }
+
+    /** Embeddings of [ids], zero-padded to [size] rows. */
+    fun lookup(ids: IntArray, size: Int): FloatArray {
+        val out = FloatArray(size * dim)
+        for ((i, id) in ids.withIndex()) {
+            require(id in 0 until rows) { "wordpiece id $id out of range" }
+            val base = HEADER + id * dim
+            for (k in 0 until dim) out[i * dim + k] = (data.get(base + k).toFloat() - zeroPoint) * scale
+        }
+        return out
+    }
+
+    private companion object {
+        const val HEADER = 20
+    }
+}
+
 /** Port of `models/homosolver.py`: BERT picks the reading of known homographs ("з+амок" / "зам+ок"). */
 class HomoSolver(
-    private val env: OrtEnvironment,
-    private val session: OrtSession,
+    private val network: Network,
+    private val embeddings: BertEmbeddings,
+    private val sizes: SignatureSizes,
     private val tokenizer: BertTokenizer,
     homodictTsv: String,
     private val ids: ModelConfig.BertIds,
 ) : java.io.Closeable {
-    override fun close() = session.close()
+    override fun close() = network.close()
+
+    /** Classifier logit for the homograph between the [start] and [end] markers of [tokens]. */
+    private fun logit(tokens: IntArray, start: Int, end: Int): Float {
+        val size = sizes.fit(tokens.size)
+        val inputs = mapOf(
+            "embeddings" to embeddings.lookup(tokens, size),
+            "mask" to lengthMask(tokens.size, size),
+            "start" to intArrayOf(start),
+            "end" to intArrayOf(end),
+        )
+        return network.run(sizes.name(size), inputs, OUTPUTS).getValue("logit")[0]
+    }
 
     /** word -> variants sorted the way the original picks them (index = model prediction). */
     val homodict: Map<String, List<String>>
@@ -162,24 +209,9 @@ class HomoSolver(
         }
         if (found.isEmpty()) return sentence
 
-        val maxLen = found.maxOf { it.ids.size }
-        val inputIds = LongBuffer.allocate(found.size * maxLen)
-        for (f in found) {
-            for (k in 0 until maxLen) inputIds.put(if (k < f.ids.size) f.ids[k].toLong() else ids.pad.toLong())
-        }
-        inputIds.rewind()
-        val starts = LongBuffer.wrap(LongArray(found.size) { found[it].marker.toLong() })
-        val ends = LongBuffer.wrap(LongArray(found.size) { found[it].markerEnd.toLong() })
-        val logits = OnnxTensor.createTensor(env, inputIds, longArrayOf(found.size.toLong(), maxLen.toLong())).use { tIds ->
-            OnnxTensor.createTensor(env, starts, longArrayOf(found.size.toLong())).use { tS ->
-                OnnxTensor.createTensor(env, ends, longArrayOf(found.size.toLong())).use { tE ->
-                    session.run(mapOf("input_ids" to tIds, "starts" to tS, "ends" to tE)).use { r ->
-                        val fb = (r[0] as OnnxTensor).floatBuffer
-                        FloatArray(fb.remaining()).also { fb.get(it) }
-                    }
-                }
-            }
-        }
+        // One homograph per run: the sequences of a sentence all have the same
+        // length, so the original's batch never contains padding either.
+        val logits = FloatArray(found.size) { logit(found[it].ids, found[it].marker, found[it].markerEnd) }
 
         val out = StringBuilder(sentence)
         var offset = 0
@@ -206,5 +238,9 @@ class HomoSolver(
             out.replace(s, e, replacement)
         }
         return out.toString()
+    }
+
+    private companion object {
+        val OUTPUTS = listOf("logit")
     }
 }

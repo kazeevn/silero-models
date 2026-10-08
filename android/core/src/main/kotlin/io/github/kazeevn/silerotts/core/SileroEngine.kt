@@ -1,16 +1,9 @@
 package io.github.kazeevn.silerotts.core
 
-import ai.onnxruntime.OnnxTensor
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtSession
 import java.io.Closeable
-import java.nio.FloatBuffer
-import java.nio.LongBuffer
-import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 
 /** Per-request synthesis parameters. */
 data class SynthesisParams(
@@ -35,41 +28,48 @@ fun interface AudioSink {
 /** Timing info of the last [SileroEngine.synthesizeChunk] call (milliseconds). */
 data class ChunkStats(
     var frontendMs: Double = 0.0,
-    var predictorsMs: Double = 0.0,
-    var acousticMs: Double = 0.0,
+    /** Duration / pitch predictors and encoder (text.tflite). */
+    var textMs: Double = 0.0,
+    /** Length regulator and decoder (decoder.tflite). */
+    var decoderMs: Double = 0.0,
     var vocoderMs: Double = 0.0,
     var firstAudioMs: Double = 0.0,
     var audioSeconds: Double = 0.0,
 )
 
 /**
- * On-device Silero v5_5_ru engine: ONNX Runtime for the networks, everything
- * else ported from the original Python package (see tools/reference_pipeline.py,
+ * On-device Silero v5_5_ru engine: LiteRT for the networks, everything else
+ * ported from the original Python package (see tools/reference_pipeline.py,
  * which this class mirrors step by step).
  */
-class SileroEngine(
-    assets: AssetSource,
-    private val env: OrtEnvironment,
-    sessionOptions: () -> OrtSession.SessionOptions,
-) : Closeable {
+class SileroEngine(assets: AssetSource, loader: NetworkLoader) : Closeable {
     val config = ModelConfig.load(assets)
     val speakers: List<String> get() = config.speakers.keys.toList()
 
-    private val predictors: OrtSession
-    private val acoustic: OrtSession
-    private val vocoder: OrtSession
+    private val networks = ArrayList<Network>()
+    private val textNet: Network
+    private val decoder: Network
+    private val vocoder: Network
     private val homo: HomoSolver
     private val accentor: Accentor
     val lastStats = ChunkStats()
 
     init {
-        fun session(name: String) = sessionOptions().use { so -> env.createSession(assets.map("$name.onnx"), so) }
-        predictors = session("predictors")
-        acoustic = session("acoustic")
-        vocoder = session("vocoder")
-        val vocab = StringHashTable(assets.map("bert_vocab.bin"))
-        homo = HomoSolver(env, session("homosolver"), BertTokenizer(vocab, config.bert), assets.text("homodict.tsv"), config.bert)
-        accentor = Accentor(assets.map("accentor.bin"), StringHashTable(assets.map("ngrams.bin")), assets.text("exceptions.tsv"), config.ngramMaxLen)
+        try {
+            fun load(name: String) = loader.load(name).also { networks.add(it) }
+            textNet = load("text")
+            decoder = load("decoder")
+            vocoder = load("vocoder")
+            val vocab = StringHashTable(assets.map("bert_vocab.bin"))
+            homo = HomoSolver(
+                load("homosolver"), BertEmbeddings(assets.map("bert_emb.bin")), config.bertSizes,
+                BertTokenizer(vocab, config.bert), assets.text("homodict.tsv"), config.bert,
+            )
+            accentor = Accentor(assets.map("accentor.bin"), StringHashTable(assets.map("ngrams.bin")), assets.text("exceptions.tsv"), config.ngramMaxLen)
+        } catch (e: Throwable) {
+            close()
+            throw e
+        }
     }
 
     private val allowed: Set<Char> = config.textAlphabet.toSet()
@@ -113,14 +113,13 @@ class SileroEngine(
 
     fun hasSpeech(cleanText: String) = cleanText.any { it in 'а'..'я' || it == 'ё' }
 
-    internal fun tokens(accented: String): LongArray {
+    internal fun tokens(accented: String): IntArray {
         val seq = "|$accented~"
-        return LongArray(seq.length) { config.symbolToId.getValue(seq[it]).toLong() }
+        return IntArray(seq.length) { config.symbolToId.getValue(seq[it]) }
     }
 
-    /** Duration post-processing of MultiTTSModel.forward (log-durations -> frames). */
-    internal fun durations(logDur: FloatArray, rate: Float): IntArray {
-        val n = logDur.size
+    /** Duration post-processing of MultiTTSModel.forward (first [n] log-durations -> frames). */
+    internal fun durations(logDur: FloatArray, n: Int, rate: Float): IntArray {
         val d = FloatArray(n) { max(exp(logDur[it]) - 1f, 0f) }
         for (i in 0 until n) d[i] = Math.rint(d[i].toDouble()).toFloat()
         d[0] = min(d[0], 5f)
@@ -140,24 +139,15 @@ class SileroEngine(
         return IntArray(n) { d[it].toInt() }
     }
 
-    /** update_pitch_coef with a constant coefficient. */
-    internal fun applyPitch(pitch: FloatArray, coef: Float, speakerId: Int) {
-        val c = if (coef == 0f) 1f else coef
-        val shift = (c - 1f) * config.meanStdCoef[speakerId]
-        for (i in pitch.indices) {
-            var p = pitch[i]
-            if (abs(p) < 0.001f) p = 0f
-            val pc = p * coef
-            pitch[i] = if (pc == 0f) 0f else pc + shift
-        }
-    }
-
     /**
      * Full text-to-speech: normalization, sentence chunking and synthesis of
      * every chunk, streamed to [sink]. Returns false if the sink aborted.
      */
     fun synthesize(text: String, p: SynthesisParams, sink: AudioSink): Boolean {
-        val chunks = TextNormalizer.chunks(TextNormalizer.normalize(text))
+        // Slow speech makes long sentences exceed the largest decoder signature
+        // (28.8 s): split them more finely.
+        val maxLen = (MAX_CHUNK_CHARS * p.rate).toInt().coerceIn(MIN_CHUNK_CHARS, MAX_CHUNK_CHARS)
+        val chunks = TextNormalizer.chunks(TextNormalizer.normalize(text), maxLen)
         for (chunk in chunks) {
             if (!synthesizeChunk(chunk.text, p, sink, chunk.sentence)) return false
             if (chunk.pauseAfterMs > 0) {
@@ -183,63 +173,82 @@ class SileroEngine(
         val spk = config.speakers[p.speaker] ?: config.speakers.values.first()
         val accented = accentuate(cleanText, p)
         val tokens = tokens(accented)
+        if (tokens.size > config.textSizes.max) return synthesizeHalves(text, p, sink, typeText)
         val typeIds = SentenceType.typeIds(typeText, tokens.size)
         val t1 = System.nanoTime()
         stats.frontendMs = (t1 - t0) / 1e6
 
-        val L = tokens.size.toLong()
-        val (logDur, pitch) = OnnxTensor.createTensor(env, LongBuffer.wrap(tokens), longArrayOf(1, L)).use { tTok ->
-            OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(spk.toLong())), longArrayOf(1)).use { tSpk ->
-                OnnxTensor.createTensor(env, LongBuffer.wrap(typeIds), longArrayOf(1, L)).use { tType ->
-                    predictors.run(mapOf("tokens" to tTok, "speaker" to tSpk, "type_ids" to tType)).use { r ->
-                        (r[0] as OnnxTensor).floats() to (r[1] as OnnxTensor).floats()
-                    }
-                }
-            }
-        }
-        val durs = durations(logDur, p.rate.coerceIn(0.2f, 4f))
-        applyPitch(pitch, p.pitch.coerceIn(0f, 2.5f), spk)
+        // durations, and the encoder output with the pitch applied
+        // (update_pitch_coef: scale, shift = (coef - 1) * mean_std_coef)
+        val n = tokens.size
+        val textSize = config.textSizes.fit(n)
+        val coef = p.pitch.coerceIn(0f, 2.5f)
+        val shift = ((if (coef == 0f) 1f else coef) - 1f) * config.meanStdCoef[spk]
+        val encoded = textNet.run(
+            config.textSizes.name(textSize),
+            mapOf(
+                "tokens" to tokens.copyOf(textSize),
+                "type_ids" to typeIds.copyOf(textSize),
+                "speaker" to intArrayOf(spk),
+                "mask" to lengthMask(n, textSize),
+                "pitch_scale" to floatArrayOf(coef),
+                "pitch_shift" to floatArrayOf(shift),
+            ),
+            TEXT_OUTPUTS,
+        )
+        val durs = durations(encoded.getValue("log_dur"), n, p.rate.coerceIn(0.2f, 4f))
         val total = durs.sum()
-        val frameIdx = LongArray(total)
-        var f = 0
-        for ((i, d) in durs.withIndex()) repeat(d) { frameIdx[f++] = i.toLong() }
+        if (total > config.decoderSizes.max) return synthesizeHalves(text, p, sink, typeText)
         val t2 = System.nanoTime()
-        stats.predictorsMs = (t2 - t1) / 1e6
+        stats.textMs = (t2 - t1) / 1e6
 
-        val mel: FloatArray = OnnxTensor.createTensor(env, LongBuffer.wrap(tokens), longArrayOf(1, L)).use { tTok ->
-            OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(spk.toLong())), longArrayOf(1)).use { tSpk ->
-                OnnxTensor.createTensor(env, FloatBuffer.wrap(pitch), longArrayOf(1, L)).use { tPitch ->
-                    OnnxTensor.createTensor(env, LongBuffer.wrap(frameIdx), longArrayOf(total.toLong())).use { tIdx ->
-                        acoustic.run(mapOf("tokens" to tTok, "speaker" to tSpk, "pitch" to tPitch, "frame_idx" to tIdx)).use { r ->
-                            (r[0] as OnnxTensor).floats()
-                        }
-                    }
-                }
-            }
+        // length regulator: every frame gets the encoder output of its token
+        val h = config.hidden
+        val hidden = encoded.getValue("hidden")
+        val frameSize = config.decoderSizes.fit(total)
+        val frames = FloatArray(frameSize * h)
+        var f = 0
+        for ((i, d) in durs.withIndex()) {
+            repeat(d) { System.arraycopy(hidden, i * h, frames, f++ * h, h) }
         }
+        val mel = decoder.run(
+            config.decoderSizes.name(frameSize),
+            mapOf("frames" to frames, "mask" to lengthMask(total, frameSize)),
+            DECODER_OUTPUTS,
+        ).getValue("mel")
         val t3 = System.nanoTime()
-        stats.acousticMs = (t3 - t2) / 1e6
+        stats.decoderMs = (t3 - t2) / 1e6
         stats.audioSeconds = total * config.hopLength / 48000.0
         val ok = vocode(mel, total, p.sampleRate, sink, t0)
         stats.vocoderMs = (System.nanoTime() - t3) / 1e6
         return ok
     }
 
-    private fun OnnxTensor.floats(): FloatArray {
-        val fb = floatBuffer
-        return FloatArray(fb.remaining()).also { fb.get(it) }
+    /** Fallback for chunks too long for the largest signature: synthesize the halves. */
+    private fun synthesizeHalves(text: String, p: SynthesisParams, sink: AudioSink, typeText: String): Boolean {
+        val mid = text.length / 2
+        var cut = text.lastIndexOf(' ', mid)
+        if (cut <= 0) cut = text.indexOf(' ', mid)
+        if (cut <= 0) cut = mid
+        require(cut in 1 until text.length) { "cannot split \"$text\"" }
+        return synthesizeChunk(text.substring(0, cut), p, sink, typeText) &&
+            synthesizeChunk(text.substring(cut), p, sink, typeText)
     }
 
     /**
-     * Runs the vocoder over the mel spectrogram in windows so that audio can be
-     * played before the whole sentence is vocoded. Every window gets
-     * [CONTEXT] frames of context on both sides, which covers the receptive
-     * field of the ConvNeXt backbone (9 convolutions with kernel 7 = 27 frames),
-     * so the output is identical to a single pass.
+     * Runs the vocoder over the mel spectrogram ([total] frames, time-major) in
+     * windows so that audio can be played before the whole sentence is vocoded.
+     * Every window gets [ModelConfig.vocoderContext] frames of context on both
+     * sides, which covers the receptive field of the ConvNeXt backbone (9
+     * convolutions with kernel 7 = 27 frames), so the output is identical to a
+     * single pass. The first window uses the smallest signature for a low
+     * latency, the following ones the largest (mirrored in reference_pipeline.py).
      */
     private fun vocode(mel: FloatArray, total: Int, sampleRate: Int, sink: AudioSink, t0: Long): Boolean {
-        val nMels = mel.size / total
+        val nMels = config.nMels
         val nBins = config.nFft / 2 + 1
+        val sizes = config.vocoderSizes
+        val context = config.vocoderContext
         val pending = SampleBuffer()
         val decimator = when (sampleRate) {
             48000 -> null
@@ -267,19 +276,25 @@ class SileroEngine(
 
         var a = 0
         while (a < total) {
-            val w = if (a == 0) FIRST_WINDOW else WINDOW
-            // avoid a tiny last window
-            val b = if (total - (a + w) < w / 2) total else a + w
-            val s = max(0, a - CONTEXT)
-            val e = min(total, b + CONTEXT)
-            val len = e - s
-            val window = FloatArray(nMels * len)
-            for (c in 0 until nMels) System.arraycopy(mel, c * total + s, window, c * len, len)
-            val (re, im) = OnnxTensor.createTensor(env, FloatBuffer.wrap(window), longArrayOf(1, nMels.toLong(), len.toLong())).use { tMel ->
-                vocoder.run(mapOf("mel" to tMel)).use { r -> (r[0] as OnnxTensor).floats() to (r[1] as OnnxTensor).floats() }
+            // output frames [a, b) from input frames [s, e)
+            val cap = if (a == 0) sizes.min else sizes.max
+            val s = max(0, a - context)
+            val b: Int
+            val e: Int
+            if (total - s <= cap) {
+                b = total
+                e = total
+            } else {
+                e = s + cap
+                b = e - context
             }
-            check(re.size == nBins * len)
-            for (t in a until b) istft.push(re, im, t - s, len)
+            val size = sizes.fit(e - s)
+            val window = FloatArray(size * nMels)
+            System.arraycopy(mel, s * nMels, window, 0, (e - s) * nMels)
+            val out = vocoder.run(sizes.name(size), mapOf("mel" to window, "mask" to lengthMask(e - s, size)), VOCODER_OUTPUTS)
+            val re = out.getValue("re")
+            val im = out.getValue("im")
+            for (t in a until b) istft.push(re, im, (t - s) * nBins, 1)
             if (b == total) decimator?.finish()
             if (!flush()) return false
             a = b
@@ -299,18 +314,16 @@ class SileroEngine(
     }
 
     override fun close() {
-        predictors.close()
-        acoustic.close()
-        vocoder.close()
-        homo.close()
+        for (n in networks) runCatching { n.close() }
+        networks.clear()
     }
 
     companion object {
-        /** Vocoder receptive field is 27 frames on each side. */
-        const val CONTEXT = 28
-        /** 48 frames = 0.6 s: small first window for low latency... */
-        const val FIRST_WINDOW = 48
-        /** ...then larger windows to keep the context overhead low (~20%). */
-        const val WINDOW = 256
+        /** Sentences longer than this are split at commas etc. (at normal speed). */
+        const val MAX_CHUNK_CHARS = 250
+        const val MIN_CHUNK_CHARS = 60
+        private val TEXT_OUTPUTS = listOf("log_dur", "hidden")
+        private val DECODER_OUTPUTS = listOf("mel")
+        private val VOCODER_OUTPUTS = listOf("re", "im")
     }
 }

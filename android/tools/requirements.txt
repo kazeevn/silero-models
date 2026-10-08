@@ -1,6 +1,8 @@
 # model export (export_models.py, optimize_models.py, reference_pipeline.py)
-# torch CPU wheels: pip install --index-url https://download.pytorch.org/whl/cpu torch
-torch>=2.5
+# torch CPU wheels: pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.13.*"
+torch>=2.5,<2.14
 numpy
-onnx
-onnxruntime==1.30.0
+# LiteRT Torch (formerly AI Edge Torch); brings ai-edge-litert (runtime, also
+# used by the Kotlin tests) and ai-edge-quantizer (fp16 weights)
+litert-torch==0.9.4
+# optional, for reference_pipeline.py --quality: pesq

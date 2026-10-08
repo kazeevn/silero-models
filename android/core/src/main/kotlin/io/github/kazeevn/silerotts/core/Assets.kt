@@ -11,8 +11,8 @@ import java.nio.charset.StandardCharsets
 interface AssetSource {
     /**
      * Returns a direct buffer with the whole file. Implementations memory-map the
-     * file when possible so that ONNX Runtime and the frontend tables read it in
-     * place without copying.
+     * file when possible so that the frontend tables are read in place without
+     * copying.
      */
     fun map(name: String): ByteBuffer
 
@@ -56,12 +56,28 @@ class ModelConfig(json: Map<String, Any?>) {
         BertIds(i("pad"), i("cls"), i("sep"), i("unk"), i("homo_start"), i("homo_end"), i("max_len"))
     }
 
+    /** Static signature sizes of the networks. */
+    val textSizes: SignatureSizes = sizes(json, "text", "L")
+    val decoderSizes: SignatureSizes = sizes(json, "decoder", "T")
+    val vocoderSizes: SignatureSizes = sizes(json, "vocoder", "W")
+    val bertSizes: SignatureSizes = sizes(json, "homosolver", "S")
+    /** Frames of context around a vocoder window (>= the vocoder's receptive field). */
+    val vocoderContext: Int = (json["vocoder_context"] as Number).toInt()
+    val nMels: Int = (json["n_mels"] as Number).toInt()
+    /** Width of the encoder output (decoder input) per token / frame. */
+    val hidden: Int = (json["hidden"] as Number).toInt()
+
     /** Characters the acoustic model accepts after the control symbols _, ~ and |. */
     val textAlphabet: String = symbols.substring(3)
 
     data class BertIds(val pad: Int, val cls: Int, val sep: Int, val unk: Int, val homoStart: Int, val homoEnd: Int, val maxLen: Int)
 
     companion object {
+        private fun sizes(json: Map<String, Any?>, network: String, prefix: String): SignatureSizes {
+            val list = (json["sizes"] as Map<*, *>)[network] as List<*>
+            return SignatureSizes(prefix, list.map { (it as Number).toInt() }.toIntArray())
+        }
+
         fun load(assets: AssetSource): ModelConfig {
             @Suppress("UNCHECKED_CAST")
             return ModelConfig(Json.parse(assets.text("config.json")) as Map<String, Any?>)

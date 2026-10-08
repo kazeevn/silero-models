@@ -14,17 +14,18 @@ kotlin {
 }
 
 dependencies {
-    // The Android app supplies onnxruntime-android (same ai.onnxruntime API);
-    // the desktop build is only used to compile and to run the JVM tests.
-    compileOnly("com.microsoft.onnxruntime:onnxruntime:1.30.0")
-    testImplementation("com.microsoft.onnxruntime:onnxruntime:1.30.0")
+    // The networks run behind the Network interface: LiteRT CompiledModel in
+    // the app, the LiteRT C API (libLiteRt.so of the ai-edge-litert wheel,
+    // through JNA) in the desktop tests.
+    testImplementation("net.java.dev.jna:jna:5.19.1")
     testImplementation(kotlin("test"))
 }
 
 tasks.test {
-    // ./gradlew :core:test -Psilero.assets=<dir with exported assets> -Psilero.vectors=<vectors.json>
+    // ./gradlew :core:test -Psilero.assets=<dir with exported assets> -Psilero.litert=<libLiteRt.so>
+    //     -Psilero.vectors=<vectors.json>
     systemProperty("silero.assets", (findProperty("silero.assets") ?: "${rootDir}/app/src/main/assets/silero").toString())
-    for (key in listOf("silero.vectors", "silero.wavOut")) findProperty(key)?.let { systemProperty(key, it.toString()) }
+    for (key in listOf("silero.litert", "silero.vectors", "silero.wavOut")) findProperty(key)?.let { systemProperty(key, it.toString()) }
     maxHeapSize = "2g"
     testLogging {
         events("passed", "skipped", "failed", "standardOut")

@@ -106,16 +106,16 @@ object SentenceType {
      * text sentence by sentence onto the token sequence (offset by the start
      * token), padding with the first sentence's type.
      */
-    fun typeIds(text: String, seqLen: Int): LongArray {
-        val out = LongArray(seqLen)
+    fun typeIds(text: String, seqLen: Int): IntArray {
+        val out = IntArray(seqLen)
         if (text.isBlank()) return out
         val types = classifyText(text)
         val sentences = SENT_SPLIT.split(text.trim())
-        val default = TYPE_IDS.getValue(types[0]).toLong()
+        val default = TYPE_IDS.getValue(types[0])
         out.fill(default)
         var idx = 1
         for ((i, s) in sentences.withIndex()) {
-            val tid = TYPE_IDS.getValue(if (i < types.size) types[i] else types.last()).toLong()
+            val tid = TYPE_IDS.getValue(if (i < types.size) types[i] else types.last())
             val n = s.length + if (i < sentences.size - 1) 1 else 0
             for (k in 0 until n) {
                 if (idx >= seqLen) return out

@@ -16,10 +16,11 @@ android {
         // built for a Pixel 8a running Android 17
         minSdk = 37
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0.0-v5_5_ru"
-        // Tensor G3 is arm64-only; dropping the other ABIs of ONNX Runtime saves ~100 MB
-        ndk { abiFilters += "arm64-v8a" }
+        versionCode = 2
+        versionName = "2.0.0-v5_5_ru"
+        // Tensor G3 is arm64-only; drop the other ABIs of the LiteRT runtime
+        // (-Psilero.abi=x86_64 builds an APK for smoke tests on the emulator)
+        ndk { abiFilters += (findProperty("silero.abi") ?: "arm64-v8a").toString() }
     }
 
     signingConfigs {
@@ -52,12 +53,13 @@ android {
     }
 
     androidResources {
-        // models and lookup tables are memory-mapped straight from the APK
-        noCompress += listOf("onnx", "bin", "tsv", "json")
+        // lookup tables are memory-mapped straight from the APK; the .tflite
+        // models stay compressed, they are extracted once (see LiteRtLoader)
+        noCompress += listOf("bin", "tsv", "json")
     }
 
     packaging {
-        // keep libonnxruntime.so uncompressed and page-aligned in the APK
+        // keep the LiteRT libraries uncompressed and page-aligned in the APK
         // (loaded in place, not extracted to disk)
         jniLibs.useLegacyPackaging = false
     }
@@ -75,12 +77,13 @@ android {
 
 dependencies {
     implementation(project(":core"))
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
+    // LiteRT CompiledModel API (CPU / XNNPACK)
+    implementation("com.google.ai.edge.litert:litert:2.3.0")
 }
 
 val checkModelAssets by tasks.registering {
     doLast {
-        if (!file("$modelAssets/config.json").exists()) {
+        if (!file("$modelAssets/config.json").exists() || !file("$modelAssets/vocoder.tflite").exists()) {
             throw GradleException(
                 "Model assets are missing in $modelAssets.\n" +
                     "Generate them with:\n" +

@@ -2,27 +2,31 @@
 
 An offline Android text-to-speech engine that runs the Silero `v5_5_ru`
 model (5 Russian voices: `xenia`, `baya`, `kseniya`, `aidar`, `eugene`)
-on-device with ONNX Runtime. After installing, select it in
+on-device with [LiteRT](https://ai.google.dev/edge/litert). The networks are
+converted from PyTorch with [AI Edge Torch](https://developers.googleblog.com/en/ai-edge-torch-high-performance-inference-of-pytorch-models-on-mobile-devices/)
+(now published as [LiteRT Torch](https://github.com/google-ai-edge/litert-torch),
+`litert-torch`) and run on the CPU with XNNPACK through the LiteRT
+`CompiledModel` API. After installing, select it in
 *Settings → System → Languages → Text-to-speech output → Preferred engine*.
 TalkBack, reading apps, navigation and anything else that uses the Android
 TTS API can then speak with Silero voices. Text is never sent anywhere.
 
 ```
 android/
-  tools/export_models.py      torch.package -> ONNX + frontend data (verified against the original)
-  tools/optimize_models.py    -> APK assets (fp16 weight storage)
-  tools/reference_pipeline.py numpy/ORT reference of the whole pipeline, test vectors
-  core/                       Kotlin engine (pure JVM, unit-tested on desktop ONNX Runtime)
-  app/                        TextToSpeechService, settings / benchmark screen
+  tools/export_models.py      torch.package -> LiteRT (.tflite) + frontend data, verified against the original
+  tools/optimize_models.py    -> APK assets (fp16 weights with the AI Edge Quantizer)
+  tools/reference_pipeline.py numpy + LiteRT reference of the whole pipeline, quality check, test vectors
+  core/                       Kotlin engine (pure JVM, tested on the desktop with the LiteRT C API)
+  app/                        TextToSpeechService on LiteRT CompiledModel, settings / benchmark screen
 ```
 
 ## Build
 
 ```bash
-pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.13.*"
 pip install -r tools/requirements.txt
 
-# 1. export the networks from the original package (downloads v5_5_ru.pt, 145 MB)
+# 1. convert the networks from the original package (downloads v5_5_ru.pt, 145 MB)
 python tools/export_models.py --package v5_5_ru.pt --out build/silero-export
 # 2. build the APK assets
 python tools/optimize_models.py --src build/silero-export --out app/src/main/assets/silero
@@ -47,13 +51,16 @@ throwaway key, so installed releases can't be updated in place.
 ### Verification
 
 ```bash
-# ONNX pipeline vs. the original torch package (identical stress, audio SNR > 60 dB)
+# LiteRT pipeline vs. the original torch package (identical stress, audio SNR > 60 dB)
 python tools/reference_pipeline.py --assets build/silero-export --compare v5_5_ru.pt
-# Kotlin engine vs. the reference pipeline (desktop ONNX Runtime)
+# fp16 weights vs. fp32 (PESQ-wb, needs `pip install pesq`)
+python tools/reference_pipeline.py --assets app/src/main/assets/silero --quality build/silero-export
+# Kotlin engine vs. the reference pipeline, on the desktop LiteRT runtime
+LITERT=$(python -c 'import ai_edge_litert, os; print(os.path.dirname(ai_edge_litert.__file__))')/libLiteRt.so
 python tools/reference_pipeline.py --assets app/src/main/assets/silero --vectors build/vectors.json
-./gradlew :core:test -Psilero.assets=$PWD/app/src/main/assets/silero -Psilero.vectors=$PWD/build/vectors.json
+./gradlew :core:test -Psilero.assets=$PWD/app/src/main/assets/silero -Psilero.litert=$LITERT -Psilero.vectors=$PWD/build/vectors.json
 # listen: writes WAVs through the full engine
-./gradlew :core:test --tests '*DemoWav*' -Psilero.wavOut=$PWD/build/demo
+./gradlew :core:test --tests '*DemoWav*' -Psilero.litert=$LITERT -Psilero.wavOut=$PWD/build/demo
 ```
 
 ## How it works
@@ -61,19 +68,38 @@ python tools/reference_pipeline.py --assets app/src/main/assets/silero --vectors
 The `v5_5_ru` package is a `torch.package` that mixes TorchScript networks
 with Python glue. Nothing of it runs on Android as is, so:
 
-* **Networks → ONNX.** `export_models.py` re-implements every network as
+* **Networks → LiteRT.** `export_models.py` re-implements every network as
   plain PyTorch (FastPitch-style duration/pitch predictors, the
   encoder/hourglass decoder, the Vocos vocoder, the BERT homograph model),
   loads the original weights, checks them against the TorchScript originals
-  (max error ≤ 1e-5, vocoder audio bit-exact) and exports them.
+  (max error ≤ 1e-5, vocoder audio bit-exact) and converts them with
+  `litert_torch`. They become four models:
+
+  | model | runs | signatures |
+  |---|---|---|
+  | `text` | duration + pitch predictors, pitch scaling, encoder; once per sentence | 32 … 512 tokens |
+  | `decoder` | hourglass decoder → mel; once per sentence | 96 … 2304 frames (28.8 s) |
+  | `vocoder` | Vocos backbone → complex spectrum; streamed in windows | 80, 160, 320 frames |
+  | `homosolver` | BERT homograph classifier; once per homograph | 32 … 512 wordpieces |
+
+* **Static shapes.** LiteRT plans memory and XNNPACK packs its kernels for
+  fixed shapes, and the Android `CompiledModel` API has no input resizing, so
+  each model has several fixed-size *signatures* sharing one copy of the
+  weights. Inputs are zero-padded to the next size and a mask restores the
+  exact unpadded result: padded keys get a −10⁴ attention bias and every
+  convolution input is masked, so padded positions look exactly like the zero
+  padding of the original convolutions (padded vs. unpadded PyTorch: max
+  difference ≤ 4·10⁻⁶). Positions are computed from the mask at runtime, so
+  the converter doesn't store a positional table per signature.
 * **Glue → Kotlin.** Text cleaning, the n-gram stress model (accentor), the
-  BERT tokenizer and homograph substitution, sentence-type classification
-  (question / exclamation intonation), duration and pitch post-processing,
-  the 2400-point ISTFT and the PQMF down-sampling to 24/8 kHz are ported to
-  Kotlin (`core/`). `reference_pipeline.py` is the same pipeline in numpy and
-  is checked against the original package: identical stressed text and audio
-  at 66–99 dB SNR on the test sentences, including speed / pitch changes.
-  The Kotlin engine matches the reference at 106–110 dB SNR.
+  BERT tokenizer and int8 word-embedding lookup, homograph substitution,
+  sentence-type classification (question / exclamation intonation), duration
+  post-processing, the length regulator, the 2400-point ISTFT and the PQMF
+  down-sampling to 24/8 kHz are ported to Kotlin (`core/`).
+  `reference_pipeline.py` is the same pipeline in numpy on the same LiteRT
+  runtime and is checked against the original package: identical stressed text
+  and audio at 67–94 dB SNR on the test sentences, including speed / pitch
+  changes. The Kotlin engine matches it at 105–110 dB SNR.
 * **Text normalization** (not part of the original model, which silently
   drops digits and Latin letters): numbers with gender/case agreement, dates,
   years, times, decimals, percent, currencies, units, ordinals ("1-й",
@@ -85,18 +111,25 @@ with Python glue. Nothing of it runs on Android as is, so:
 
 | | |
 |---|---|
-| **Model size** | 130 MB fp32 → 67 MB: weights stored as fp16 with a `Cast` that ONNX Runtime constant-folds at load, so inference runs on the fp32 NEON kernels at full speed and quality (PESQ-wb vs fp32 4.63, where 4.64 = identical). BERT vocabulary pruned to the 51.8k wordpieces the frontend can produce (lossless); positional encodings computed in-graph; a dead decoder layer whose output was discarded removed. |
-| **Quantization** | Measured and rejected: int8 activations (dynamic int8, `MatMulNBits` accuracy level 4) cost 0.3–0.6 PESQ on the male voices, 4-bit ~0.9. |
-| **Memory / load** | Models and lookup tables are stored uncompressed in the APK and memory-mapped (`createSession(ByteBuffer)`, n-gram/vocab hash tables read in place): no extraction, no Java heap copies, no parsing of the 126k n-grams. `libonnxruntime.so` is page-aligned (16 KB) and loaded from the APK. |
-| **Target** | Android 17 (API 37) only, arm64-v8a only (Tensor G3): no compatibility code, ~100 MB of other ABIs dropped. |
-| **Threads** | ONNX Runtime uses one thread per performance core, detected from cpufreq (Pixel 8a: 4× Cortex-A715 + 1× Cortex-X3, the A510 little cores are skipped); spin-waiting is disabled because synthesis is throttled by playback. Adjustable in the settings. |
-| **Latency** | Text is split into sentences and the vocoder runs in windows (48 frames first, then 256) with 28 frames of context, which covers its receptive field exactly, so the first 0.6 s of audio is played while the rest is still being generated, with output identical to a single pass. |
-| **Fast speech** | Speech rate scales the predicted durations like the original SSML `prosody rate`, but keeps at least one frame per sound so screen-reader speeds don't drop phonemes. |
+| **Runtime** | LiteRT 2.3 `CompiledModel` on the CPU with XNNPACK. The vocoder (most of the compute) is delegated completely, including GELU, sin/cos and the layer norms; the other networks run a few tiny ops (embedding lookups, the position cumsum, the pitch-scaling selects) on LiteRT's builtin kernels, which costs nothing measurable. The Pixel 8a's NPU can't be used: LiteRT supports the Google Tensor NPU only from Tensor G5. |
+| **Model size** | 93 MB fp32 → 49 MB (text 8.8, decoder 5.1, vocoder 29.3, homosolver 5.8 MB): fully connected / convolution weights stored as fp16 by the AI Edge Quantizer (weight-only float casting); XNNPACK up-casts them once, so inference runs on the fp32 kernels at full speed. PESQ-wb vs fp32 on 30 sentences × voices: mean 4.639, min 4.591 (4.64 = identical), identical durations. Signatures share the weights, and positions are computed at runtime rather than stored per signature. The duration and pitch predictors stay fp32 (0.5M weights): durations are rounded to frames, and fp16 pitch-predictor weights lowered PESQ-wb to 4.45 on one test sentence. BERT vocabulary pruned to the 51.8k wordpieces the frontend can produce (lossless), its int8 word embeddings looked up by the engine. |
+| **Quantization** | Integer quantization rejected: dynamic int8 (AI Edge Quantizer `dynamic_wi8_afp32`, XNNPACK int8 kernels) on the decoder + vocoder is 2–3× faster but drops PESQ-wb to 2.5–4.0, clearly audible. |
+| **Memory / load** | Models are extracted from the APK once and loaded by path, so LiteRT memory-maps them (loading from the `AssetManager` copies them to the native heap). XNNPACK keeps the packed weights in a file-backed cache (`xnnPackWeightCachePath`): the signatures of a network share one memory-mapped copy instead of packing their own. With every signature in use that is +124 MB of private memory instead of +489 MB, and loading takes 0.14 s instead of 0.5 s (desktop); a typical sentence needs 15–25 MB of activations. Later starts skip the packing. Lookup tables are memory-mapped from the uncompressed APK and read in place. |
+| **Target** | Android 17 (API 37) only, arm64-v8a only (Tensor G3): no compatibility code, other ABIs dropped; native libraries page-aligned (16 KB) and loaded from the APK. |
+| **Threads** | XNNPACK uses one thread per performance core, detected from cpufreq (Pixel 8a: 4× Cortex-A715 + 1× Cortex-X3, the A510 little cores are skipped). Adjustable in the settings. |
+| **Latency** | Text is split into sentences and the vocoder runs in windows (52 frames first, then 264) with 28 frames of context, which covers its receptive field exactly, so the first 0.65 s of audio is played while the rest is still being generated, with output identical to a single pass. The small signatures are warmed up right after loading. |
+| **Fast speech** | Speech rate scales the predicted durations like the original SSML `prosody rate`, but keeps at least one frame per sound so screen-reader speeds don't drop phonemes. Slow speech splits sentences more finely so they fit the largest decoder signature. |
 
-On this desktop x86 machine (4 threads) the engine generates speech about
-15–20× faster than real time. **It has not been measured on a Pixel 8a**;
-the app's *Benchmark* button reports model load time, first-audio latency and
-the real-time factor on the device.
+On this desktop x86 machine the Kotlin engine (LiteRT C API, default
+threading) generates speech about 13× faster than real time, with 55–120 ms
+to the first audio; the vocoder alone runs at ~100× real time on 4 XNNPACK
+threads. **It has not been measured on a Pixel 8a**; the app's *Benchmark*
+button reports model load time, first-audio latency and the real-time factor
+on the device.
+
+The first start after installing or updating extracts the models (49 MB) and
+builds the XNNPACK weight cache (87 MB) in the app's private storage; later
+starts memory-map both.
 
 ## Settings
 

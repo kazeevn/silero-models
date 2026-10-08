@@ -136,12 +136,12 @@ class SettingsActivity : Activity() {
                 val chunks = TextNormalizer.chunks(TextNormalizer.normalize(text))
                 val lines = StringBuilder()
                 synchronized(EngineHolder.lock) {
-                    // warm-up (first runs allocate ORT buffers)
+                    // warm-up (first runs allocate the tensor buffers of a signature)
                     engine.synthesizeChunk(chunks[0].text, params, { _, _ -> true }, chunks[0].sentence)
                     var audio = 0.0
                     var frontend = 0.0
-                    var predictors = 0.0
-                    var acoustic = 0.0
+                    var textNet = 0.0
+                    var decoder = 0.0
                     var vocoder = 0.0
                     var firstAudio = 0.0
                     val t0 = SystemClock.elapsedRealtimeNanos()
@@ -151,19 +151,20 @@ class SettingsActivity : Activity() {
                         if (i == 0) firstAudio = s.firstAudioMs
                         audio += s.audioSeconds
                         frontend += s.frontendMs
-                        predictors += s.predictorsMs
-                        acoustic += s.acousticMs
+                        textNet += s.textMs
+                        decoder += s.decoderMs
                         vocoder += s.vocoderMs
                     }
                     val total = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6
+                    lines.append("runtime        LiteRT CPU (XNNPACK)\n")
                     lines.append("threads        ${EngineHolder.currentThreads()}\n")
                     lines.append("model load     ${EngineHolder.loadTimeMs} ms\n")
                     lines.append("first audio    %.0f ms\n".format(firstAudio))
                     lines.append("audio          %.2f s @ %d Hz\n".format(audio, params.sampleRate))
                     lines.append("synthesis      %.0f ms\n".format(total))
                     lines.append("real-time      x%.1f (RTF %.3f)\n".format(audio * 1000 / total, total / 1000 / audio))
-                    lines.append("  frontend     %.0f ms\n  predictors   %.0f ms\n  acoustic     %.0f ms\n  vocoder      %.0f ms\n"
-                        .format(frontend, predictors, acoustic, vocoder))
+                    lines.append("  frontend     %.0f ms\n  text         %.0f ms\n  decoder      %.0f ms\n  vocoder      %.0f ms\n"
+                        .format(frontend, textNet, decoder, vocoder))
                 }
                 lines.toString()
             } catch (e: Exception) {

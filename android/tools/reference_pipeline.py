@@ -1,11 +1,14 @@
-"""Reference implementation of the on-device pipeline in numpy + ONNX Runtime.
+"""Reference implementation of the on-device pipeline in numpy + LiteRT.
 
 It only uses the artifacts produced by export_models.py and mirrors the Kotlin
-engine (core/src/main/kotlin/...) step by step, so it serves both to validate
-the export against the original torch.package and to produce test vectors for
-the Kotlin unit tests.
+engine (core/src/main/kotlin/...) step by step, including the static signature
+sizes and the vocoder windows, and runs the .tflite models with the same LiteRT
+CompiledModel runtime (XNNPACK) as the app.  It serves to validate the export
+against the original torch.package, to measure the effect of the fp16 weights
+and to produce test vectors for the Kotlin unit tests.
 
     python reference_pipeline.py --assets DIR --compare v5_5_ru.pt
+    python reference_pipeline.py --assets DIR --quality FP32_DIR
     python reference_pipeline.py --assets DIR --vectors out.json
 """
 import argparse
@@ -17,9 +20,85 @@ import struct
 import sys
 
 import numpy as np
-import onnxruntime as ort
 
 VOWELS = 'аоуыэиеяёю'
+
+
+# ----------------------------------------------------------------------------
+# LiteRT
+# ----------------------------------------------------------------------------
+
+class Network:
+    """A .tflite model with static-size signatures, run with the LiteRT
+    CompiledModel API on the CPU (XNNPACK), like the Android app."""
+
+    def __init__(self, path, threads=4):
+        from ai_edge_litert.compiled_model import CompiledModel
+        from ai_edge_litert.cpu_options import CpuOptions
+        from ai_edge_litert.hardware_accelerator import HardwareAccelerator
+        from ai_edge_litert.options import Options
+        opts = Options(hardware_accelerators=HardwareAccelerator.CPU, cpu_options=CpuOptions(num_threads=threads))
+        self.model = CompiledModel.from_file(path, options=opts)
+        self.signatures = self.model.get_signature_list()
+        self._buffers = {}
+
+    def run(self, signature, **inputs):
+        m = self.model
+        if signature not in self._buffers:
+            idx = m.get_signature_index(signature)
+            self._buffers[signature] = (idx, m.create_input_buffers(idx), m.create_output_buffers(idx),
+                                        m.get_input_tensor_details(signature), m.get_output_tensor_details(signature))
+        idx, ins, outs, in_det, out_det = self._buffers[signature]
+        names = self.signatures[signature]
+        for name, buf in zip(names['inputs'], ins):
+            d = in_det[name]
+            x = np.ascontiguousarray(inputs[name], dtype=d['dtype'])
+            assert list(x.shape) == list(d['shape']), (signature, name, x.shape, d['shape'])
+            buf.write(x)
+        m.run_by_index(idx, ins, outs)
+        res = {}
+        for name, buf in zip(names['outputs'], outs):
+            d = out_det[name]
+            res[name] = buf.read(int(np.prod(d['shape'])), d['dtype']).reshape(d['shape'])
+        return res
+
+
+def bucket(sizes, n):
+    """Smallest static signature size that fits n."""
+    for s in sizes:
+        if s >= n:
+            return s
+    raise ValueError(f'{n} exceeds the largest signature size {sizes[-1]}')
+
+
+def padded(x, size, axis=0, value=0):
+    pad = [(0, 0)] * x.ndim
+    pad[axis] = (0, size - x.shape[axis])
+    return np.pad(x, pad, constant_values=value)
+
+
+def length_mask(n, size):
+    m = np.zeros((1, size), np.float32)
+    m[0, :n] = 1
+    return m
+
+
+def vocoder_windows(total, sizes, context):
+    """Vocoder windows as (a, b, s, e, size): output frames [a, b) computed
+    from input frames [s, e) zero-padded to the signature size.  The first
+    window is small for a low latency (mirrored in SileroEngine.kt)."""
+    out, a = [], 0
+    while a < total:
+        cap = sizes[0] if a == 0 else sizes[-1]
+        s = max(0, a - context)
+        if total - s <= cap:
+            b = e = total
+        else:
+            e = s + cap
+            b = e - context
+        out.append((a, b, s, e, bucket(sizes, e - s)))
+        a = b
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -274,10 +353,18 @@ class BertTokenizer:
 
 
 class HomoSolver:
-    def __init__(self, assets, cfg, sess):
+    def __init__(self, assets, cfg, net, sizes):
         self.tok = BertTokenizer(assets, cfg)
         self.cfg = cfg
-        self.sess = sess
+        self.net = net
+        self.sizes = sizes
+        with open(os.path.join(assets, 'bert_emb.bin'), 'rb') as f:
+            data = f.read()
+        magic, v, d = struct.unpack_from('<4sii', data, 0)
+        assert magic == b'BEM1'
+        scale, zp = struct.unpack_from('<ff', data, 12)
+        self.emb_q = np.frombuffer(data, np.int8, v * d, 20).reshape(v, d)
+        self.emb_scale, self.emb_zp = np.float32(scale), np.float32(zp)
         self.homodict = {}
         with open(os.path.join(assets, 'homodict.tsv'), encoding='utf-8') as f:
             for line in f:
@@ -285,27 +372,35 @@ class HomoSolver:
                 self.homodict[parts[0]] = parts[1:]
         self.pattern = re.compile(r'(?=.*[а-яё])[а-яё+]+', re.IGNORECASE)
 
+    def logit(self, ids, start, end):
+        n = len(ids)
+        size = bucket(self.sizes, n)
+        emb = (self.emb_q[np.array(ids)].astype(np.float32) - self.emb_zp) * self.emb_scale
+        out = self.net.run(f'S{size}', embeddings=padded(emb, size)[None], mask=length_mask(n, size),
+                           start=np.array([start], np.int32), end=np.array([end], np.int32))
+        return out['logit'][0]
+
     def __call__(self, sentence, put_stress=True, put_yo=True, stress_single_vowel=True):
         if not (put_stress or put_yo):
             return sentence
         found = []
+        max_len = self.cfg['max_len']
         for m in self.pattern.finditer(sentence):
             s, e = m.span()
             w = m.group()
             if w.lower() in self.homodict:
                 ids = self.tok(sentence[:s] + ' [HOMO] ' + w + ' [/HOMO] ' + sentence[e:])
-                found.append((s, e, w, ids))
-        if not found:
-            return sentence
-        L = max(len(f[3]) for f in found)
-        ids = np.full((len(found), L), self.cfg['pad'], dtype=np.int64)
-        for i, f in enumerate(found):
-            ids[i, :len(f[3])] = f[3]
-        st = np.array([f[3].index(self.cfg['homo_start']) for f in found], dtype=np.int64)
-        en = np.array([f[3].index(self.cfg['homo_end']) for f in found], dtype=np.int64)
-        logits = self.sess.run(None, {'input_ids': ids, 'starts': st, 'ends': en})[0]
+                st, en = ids.index(self.cfg['homo_start']), ids.index(self.cfg['homo_end'])
+                if len(ids) > max_len:
+                    # keep a window around the homograph (mirrors HomoSolver.kt)
+                    inner = max_len - 2
+                    frm = min(max(st - inner // 2, 1), len(ids) - 1 - inner)
+                    ids = [self.cfg['cls']] + ids[frm:frm + inner] + [self.cfg['sep']]
+                    st -= frm - 1
+                    en -= frm - 1
+                found.append((s, e, w, self.logit(ids, st, en)))
         out, offset = sentence, 0
-        for (s, e, w, _), lg in zip(found, logits):
+        for s, e, w, lg in found:
             pred = int(np.round(1 / (1 + np.exp(-np.float32(lg)))))
             wp = self.homodict[w.lower()][pred]
             if not put_yo:
@@ -416,20 +511,15 @@ class Pipeline:
         self.keep_short = keep_short
         with open(os.path.join(assets, 'config.json'), encoding='utf-8') as f:
             self.cfg = json.load(f)
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = threads
+        self.sizes = self.cfg['sizes']
 
-        def sess(name):
-            for ext in ('.ort', '.onnx'):
-                p = os.path.join(assets, name + ext)
-                if os.path.exists(p):
-                    return ort.InferenceSession(p, so, providers=['CPUExecutionProvider'])
-            raise FileNotFoundError(name)
+        def net(name):
+            return Network(os.path.join(assets, name + '.tflite'), threads)
 
-        self.preds = sess('predictors')
-        self.acoustic = sess('acoustic')
-        self.vocoder = sess('vocoder')
-        self.homo = HomoSolver(assets, self.cfg['bert'], sess('homosolver'))
+        self.text_net = net('text')
+        self.decoder = net('decoder')
+        self.vocoder = net('vocoder')
+        self.homo = HomoSolver(assets, self.cfg['bert'], net('homosolver'), self.sizes['homosolver'])
         self.acc = Accentor(assets, self.cfg['ngram_max_len'])
         self.sym = self.cfg['symbol_to_id']
         n = self.cfg['n_fft']
@@ -464,32 +554,46 @@ class Pipeline:
         d[-3] = min(d[-3], 13)
         return d.astype(np.int64)
 
-    def pitch_coef(self, pitch, coef, speaker_id):
-        p = pitch.copy()
-        p[np.abs(p) < 0.001] = 0
-        pc = p * np.float32(coef)
+    def pitch_params(self, coef, speaker_id):
+        """update_pitch_coef as (scale, shift) for the text model."""
         c = np.float32(1.0 if coef == 0 else coef)
-        shift = np.full_like(p, (c - np.float32(1)) * np.float32(self.cfg['mean_std_coef'][speaker_id]))
-        shift[pc == 0] = 0
-        return pc + shift
+        return np.float32(coef), (c - np.float32(1)) * np.float32(self.cfg['mean_std_coef'][speaker_id])
 
     def mel(self, raw_text, speaker='xenia', rate=1.0, pitch=1.0):
         text = self.accentuate(self.clean(raw_text))
         seq = '|' + text + '~'
-        tokens = np.array([[self.sym[c] for c in seq]], np.int64)
+        tokens = np.array([self.sym[c] for c in seq], np.int32)
+        L = len(tokens)
         spk = self.cfg['speakers'][speaker]
-        type_ids = type_ids_for(raw_text, tokens.shape[1])
-        log_dur, p = self.preds.run(None, {'tokens': tokens, 'speaker': np.array([spk], np.int64), 'type_ids': type_ids})
-        durs = self.durations(log_dur[0], rate)
-        p = self.pitch_coef(p, pitch, spk)
-        frame_idx = np.repeat(np.arange(len(durs)), durs).astype(np.int64)
-        mel = self.acoustic.run(None, {'tokens': tokens, 'speaker': np.array([spk], np.int64), 'pitch': p,
-                                       'frame_idx': frame_idx})[0]
-        return text, tokens[0], durs, mel
+        type_ids = type_ids_for(raw_text, L)[0].astype(np.int32)
+        scale, shift = self.pitch_params(pitch, spk)
+        size = bucket(self.sizes['text'], L)
+        out = self.text_net.run(f'L{size}', tokens=padded(tokens, size)[None], type_ids=padded(type_ids, size)[None],
+                                speaker=np.array([spk], np.int32), mask=length_mask(L, size),
+                                pitch_scale=np.array([scale], np.float32), pitch_shift=np.array([shift], np.float32))
+        durs = self.durations(out['log_dur'][0, :L], rate)
+        hidden = out['hidden'][0, :L]
+        frames = np.repeat(hidden, durs, axis=0)
+        T = frames.shape[0]
+        size = bucket(self.sizes['decoder'], T)
+        mel = self.decoder.run(f'T{size}', frames=padded(frames, size)[None], mask=length_mask(T, size))['mel'][0, :T]
+        return text, tokens, durs, mel  # mel [T, 192]
+
+    def spectrum(self, mel):
+        """Windowed vocoder (as streamed by the engine) -> re, im [T, n_bins]."""
+        T = mel.shape[0]
+        n_bins = self.cfg['n_fft'] // 2 + 1
+        re_ = np.zeros((T, n_bins), np.float32)
+        im = np.zeros((T, n_bins), np.float32)
+        for a, b, s, e, size in vocoder_windows(T, self.sizes['vocoder'], self.cfg['vocoder_context']):
+            out = self.vocoder.run(f'W{size}', mel=padded(mel[s:e], size)[None], mask=length_mask(e - s, size))
+            re_[a:b] = out['re'][0, a - s:b - s]
+            im[a:b] = out['im'][0, a - s:b - s]
+        return re_, im
 
     def istft(self, re_, im):
         n, hop = self.cfg['n_fft'], self.cfg['hop_length']
-        spec = re_[0] + 1j * im[0]  # [1201, T]
+        spec = re_.T + 1j * im.T  # [n_bins, T]
         frames = np.fft.irfft(spec, n=n, axis=0).astype(np.float32) * self.window[:, None]
         T = frames.shape[1]
         out_len = (T - 1) * hop + n
@@ -516,8 +620,7 @@ class Pipeline:
 
     def __call__(self, raw_text, speaker='xenia', sr=24000, rate=1.0, pitch=1.0):
         text, tokens, durs, mel = self.mel(raw_text, speaker, rate, pitch)
-        re_, im = self.vocoder.run(None, {'mel': mel})
-        audio = self.downsample(self.istft(re_, im), sr)
+        audio = self.downsample(self.istft(*self.spectrum(mel)), sr)
         if np.abs(audio).max() > 1:
             audio = np.clip(audio, -1, 1)
         return {'text': text, 'tokens': tokens, 'durs': durs, 'mel': mel, 'audio': audio}
@@ -574,10 +677,32 @@ def compare(pipe, package_path, sr, speakers):
     return worst_snr, mismatches
 
 
+def quality(pipe, ref_assets, speakers):
+    """Audio of these assets vs the fp32 export: SNR and PESQ-wb (4.64 = identical)."""
+    from pesq import pesq
+    from scipy.signal import resample_poly
+    ref = Pipeline(ref_assets)
+    scores, snrs = [], []
+    for text in TEST_TEXTS[:6]:
+        for spk in speakers:
+            a = ref(text, spk)
+            b = pipe(text, spk)
+            same = np.array_equal(a['durs'], b['durs'])
+            n = min(len(a['audio']), len(b['audio']))
+            x, y = a['audio'][:n], b['audio'][:n]
+            snr = 10 * np.log10((x ** 2).sum() / max(((x - y) ** 2).sum(), 1e-20))
+            q = pesq(16000, resample_poly(x, 2, 3), resample_poly(y, 2, 3), 'wb')
+            scores.append(q)
+            snrs.append(snr)
+            print(f'{spk:8s} pesq={q:.3f} snr={snr:5.1f} dB same_durations={same}  {text[:40]}')
+    print(f'PESQ-wb mean {np.mean(scores):.3f} min {np.min(scores):.3f}; SNR mean {np.mean(snrs):.1f} dB')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--assets', required=True)
     ap.add_argument('--compare', help='original v5_5_ru.pt to compare against')
+    ap.add_argument('--quality', help='fp32 export directory to measure the assets against')
     ap.add_argument('--vectors', help='write Kotlin test vectors to this json')
     ap.add_argument('--sr', type=int, default=24000)
     args = ap.parse_args()
@@ -587,6 +712,8 @@ def main():
         worst_snr, mismatches = compare(pipe, args.compare, args.sr, speakers)
         if mismatches or worst_snr < 40:
             sys.exit('reference pipeline deviates from the original package')
+    if args.quality:
+        quality(pipe, args.quality, speakers)
     if args.vectors:
         cases = []
         for i, text in enumerate(TEST_TEXTS):

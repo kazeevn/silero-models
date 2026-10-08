@@ -1,8 +1,5 @@
 package io.github.kazeevn.silerotts
 
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtLoggingLevel
-import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.AssetManager
@@ -56,9 +53,17 @@ object EngineHolder {
         loadedThreads = threads
         return loader.submit<SileroEngine> {
             val t0 = SystemClock.elapsedRealtime()
-            val engine = SileroEngine(ApkAssetSource(app.assets, "silero"), env) { sessionOptions(threads) }
+            val engine = SileroEngine(ApkAssetSource(app.assets, LiteRtLoader.ASSET_DIR), LiteRtLoader(app, threads))
             loadTimeMs = SystemClock.elapsedRealtime() - t0
-            Log.i(TAG, "models loaded in $loadTimeMs ms with $threads threads")
+            // allocate the buffers of the small signatures used by the first
+            // sentence, so the first request does not pay for it
+            try {
+                synchronized(lock) { engine.synthesizeChunk(WARM_UP, SynthesisParams(), { _, _ -> true }) }
+            } catch (e: Throwable) {
+                engine.close()
+                throw e
+            }
+            Log.i(TAG, "models loaded in $loadTimeMs ms (+ warm-up ${SystemClock.elapsedRealtime() - t0 - loadTimeMs} ms) with $threads threads")
             engine
         }.also { future = it }
     }
@@ -67,20 +72,7 @@ object EngineHolder {
 
     fun currentThreads() = loadedThreads
 
-    private val env: OrtEnvironment by lazy { OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING, "silero") }
-
-    private fun sessionOptions(threads: Int) = OrtSession.SessionOptions().apply {
-        setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        setIntraOpNumThreads(threads)
-        setInterOpNumThreads(1)
-        setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-        // input shapes change with every sentence: memory patterns would not be reused
-        setMemoryPatternOptimization(false)
-        // synthesis is throttled by playback, so worker threads mostly wait;
-        // spinning would just burn battery
-        addConfigEntry("session.intra_op.allow_spinning", "0")
-        addConfigEntry("session.inter_op.allow_spinning", "0")
-    }
+    private const val WARM_UP = "Привет."
 
     /** Thread count from the settings, "auto" = number of non-LITTLE cores. */
     fun threads(context: Context): Int {

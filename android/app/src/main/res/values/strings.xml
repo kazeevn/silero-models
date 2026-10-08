@@ -18,5 +18,5 @@
     <string name="benchmark">Benchmark</string>
     <string name="benchmark_running">Benchmarking…</string>
     <string name="tts_settings">Open system text-to-speech settings</string>
-    <string name="about">Engine: Silero TTS v5_5_ru (CC BY-NC-SA 4.0, silero.ai) running on-device with ONNX Runtime. Text is never sent anywhere.\n\nTo use it system-wide, select this app as the preferred engine in the system text-to-speech settings.</string>
+    <string name="about">Engine: Silero TTS v5_5_ru (CC BY-NC-SA 4.0, silero.ai) running on-device with LiteRT (models converted with AI Edge Torch). Text is never sent anywhere.\n\nTo use it system-wide, select this app as the preferred engine in the system text-to-speech settings.</string>
 </resources>
