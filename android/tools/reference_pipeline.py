@@ -4,7 +4,7 @@ It only uses the artifacts produced by export_models.py and mirrors the Kotlin
 engine (core/src/main/kotlin/...) step by step, including the static signature
 sizes and the vocoder windows, and runs the .tflite models with the same LiteRT
 CompiledModel runtime (XNNPACK) as the app.  It serves to validate the export
-against the original torch.package, to measure the effect of the fp16 weights
+against the original torch.package, to measure the effect of optional fp16 weights
 and to produce test vectors for the Kotlin unit tests.
 
     python reference_pipeline.py --assets DIR --compare v5_5_ru.pt

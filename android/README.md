@@ -14,7 +14,7 @@ TTS API can then speak with Silero voices. Text is never sent anywhere.
 ```
 android/
   tools/export_models.py      torch.package -> LiteRT (.tflite) + frontend data, verified against the original
-  tools/optimize_models.py    -> APK assets (fp16 weights with the AI Edge Quantizer)
+  tools/optimize_models.py    -> APK assets (fp32 weights; optional fp16 with the AI Edge Quantizer)
   tools/reference_pipeline.py numpy + LiteRT reference of the whole pipeline, quality check, test vectors
   core/                       Kotlin engine (pure JVM, tested on the desktop with the LiteRT C API)
   app/                        TextToSpeechService on LiteRT CompiledModel, settings / benchmark screen
@@ -56,7 +56,7 @@ throwaway key, so installed releases can't be updated in place.
 ```bash
 # LiteRT pipeline vs. the original torch package (identical stress, audio SNR > 60 dB)
 python tools/reference_pipeline.py --assets build/silero-export --compare v5_5_ru.pt
-# fp16 weights vs. fp32 (PESQ-wb, needs `pip install pesq`)
+# only for assets built with optimize_models.py --fp16: fp16 weights vs. fp32 (PESQ-wb, needs `pip install pesq`)
 python tools/reference_pipeline.py --assets app/src/main/assets/silero --quality build/silero-export
 # Kotlin engine vs. the reference pipeline, on the desktop LiteRT runtime
 LITERT=$(python -c 'import ai_edge_litert, os; print(os.path.dirname(ai_edge_litert.__file__))')/libLiteRt.so
@@ -115,7 +115,7 @@ with Python glue. Nothing of it runs on Android as is, so:
 | | |
 |---|---|
 | **Runtime** | LiteRT 2.3 `CompiledModel` on the CPU with XNNPACK. The vocoder (most of the compute) is delegated completely, including GELU, sin/cos and the layer norms; the other networks run a few tiny ops (embedding lookups, the position cumsum, the pitch-scaling selects) on LiteRT's builtin kernels, which costs nothing measurable. The Pixel 8a's NPU can't be used: LiteRT supports the Google Tensor NPU only from Tensor G5. |
-| **Model size** | 93 MB fp32 → 49 MB (text 8.8, decoder 5.1, vocoder 29.3, homosolver 5.8 MB): fully connected / convolution weights stored as fp16 by the AI Edge Quantizer (weight-only float casting); XNNPACK up-casts them once, so inference runs on the fp32 kernels at full speed. PESQ-wb vs fp32 on 30 sentences × voices: mean 4.639, min 4.591 (4.64 = identical), identical durations. Signatures share the weights, and positions are computed at runtime rather than stored per signature. The duration and pitch predictors stay fp32 (0.5M weights): durations are rounded to frames, and fp16 pitch-predictor weights lowered PESQ-wb to 4.45 on one test sentence. BERT vocabulary pruned to the 51.8k wordpieces the frontend can produce (lossless), its int8 word embeddings looked up by the engine. |
+| **Model size** | 93 MB, weights shipped as fp32 (exactly as exported). Signatures share the weights, and positions are computed at runtime rather than stored per signature. BERT vocabulary pruned to the 51.8k wordpieces the frontend can produce (lossless), its int8 word embeddings looked up by the engine. `optimize_models.py --fp16` stores the fully connected / convolution weights as fp16 instead (AI Edge Quantizer weight-only float casting; the duration and pitch predictors stay fp32): 49 MB, but XNNPACK up-casts them to fp32 once, so this saves only storage, not memory or time, and costs a little quality (PESQ-wb vs fp32 on 30 sentences × voices: mean 4.639, min 4.591, where 4.64 = identical). Not used, since the space isn't worth it. |
 | **Quantization** | Integer quantization rejected: dynamic int8 (AI Edge Quantizer `dynamic_wi8_afp32`, XNNPACK int8 kernels) on the decoder + vocoder is 2–3× faster but drops PESQ-wb to 2.5–4.0, clearly audible. |
 | **Memory / load** | Models are extracted from the APK once and loaded by path, so LiteRT memory-maps them (loading from the `AssetManager` copies them to the native heap). XNNPACK keeps the packed weights in a file-backed cache (`xnnPackWeightCachePath`): the signatures of a network share one memory-mapped copy instead of packing their own. With every signature in use that is +124 MB of private memory instead of +489 MB, and loading takes 0.14 s instead of 0.5 s (desktop); a typical sentence needs 15–25 MB of activations. Later starts skip the packing. Lookup tables are memory-mapped from the uncompressed APK and read in place. |
 | **Target** | Android 17 (API 37) only, arm64-v8a only (Tensor G3): no compatibility code, other ABIs dropped; native libraries page-aligned (16 KB) and loaded from the APK. |
@@ -130,7 +130,7 @@ threads. **It has not been measured on a Pixel 8a**; the app's *Benchmark*
 button reports model load time, first-audio latency and the real-time factor
 on the device.
 
-The first start after installing or updating extracts the models (49 MB) and
+The first start after installing or updating extracts the models (93 MB) and
 builds the XNNPACK weight cache (87 MB) in the app's private storage; later
 starts memory-map both.
 

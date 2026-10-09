@@ -46,14 +46,8 @@ jobs:
       - name: Verify the LiteRT pipeline against the original package
         run: python tools/reference_pipeline.py --assets build/silero-export --compare build/v5_5_ru.pt
 
-      - name: Build APK model assets (fp16 weights)
+      - name: Build APK model assets (fp32 weights)
         run: python tools/optimize_models.py --src build/silero-export --out app/src/main/assets/silero
-
-      - name: Quality of the fp16 weights (PESQ vs fp32)
-        continue-on-error: true
-        run: |
-          pip install pesq
-          python tools/reference_pipeline.py --assets app/src/main/assets/silero --quality build/silero-export
 
       - name: Write Kotlin test vectors
         run: python tools/reference_pipeline.py --assets app/src/main/assets/silero --vectors build/vectors.json

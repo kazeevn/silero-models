@@ -1,12 +1,15 @@
 """Turn the fp32 LiteRT export into the model assets shipped in the APK.
 
-Weights of the fully connected / convolution layers are stored as fp16 with
-the AI Edge Quantizer's float casting (weight-only, explicit DEQUANTIZE).  The
-XNNPACK delegate up-casts them once when the model is compiled, so inference
-runs on the regular fp32 kernels at full speed and quality while the files are
-half the size (PESQ-wb vs fp32 is measured by reference_pipeline.py --quality).
+By default the models are shipped as exported, with fp32 weights.
 
-Kept fp32 (0.5M parameters):
+With --fp16 the weights of the fully connected / convolution layers are stored
+as fp16 with the AI Edge Quantizer's float casting (weight-only, explicit
+DEQUANTIZE).  The XNNPACK delegate up-casts them once when the model is
+compiled, so inference runs on the same fp32 kernels and memory; only the
+files are half the size, at a small quality cost (PESQ-wb vs fp32 is measured
+by reference_pipeline.py --quality).
+
+Kept fp32 with --fp16 (0.5M parameters):
   * the duration predictor (``d_*`` layers of text.tflite): its output is
     rounded to frame counts, and fp16 weights would occasionally flip a
     rounding (one frame more or less for a sound);
@@ -20,7 +23,7 @@ Integer quantization was measured and rejected for audible degradation (see
 README.md).
 
 Usage:
-    python optimize_models.py --src export_dir --out android/app/src/main/assets/silero
+    python optimize_models.py --src export_dir --out android/app/src/main/assets/silero [--fp16]
 """
 import argparse
 import os
@@ -53,14 +56,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--src', required=True, help='output directory of export_models.py')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--fp16', action='store_true', help='store FC / conv weights as fp16 (half the size, slightly lower quality)')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     for name in MODELS:
         src = os.path.join(args.src, name + '.tflite')
         dst = os.path.join(args.out, name + '.tflite')
-        # op scopes are the PyTorch module paths, e.g. .../ForwardTransformer_d_tr/...
-        fp16_weights(src, dst, skip=FP32_SCOPES.get(name))
+        if args.fp16:
+            # op scopes are the PyTorch module paths, e.g. .../ForwardTransformer_d_tr/...
+            fp16_weights(src, dst, skip=FP32_SCOPES.get(name))
+        else:
+            shutil.copy(src, dst)
         print(f'{name}: {os.path.getsize(src) / 1e6:.1f} MB -> {os.path.getsize(dst) / 1e6:.1f} MB')
 
     for f in DATA_FILES:

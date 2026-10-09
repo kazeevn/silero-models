@@ -3,6 +3,6 @@
 torch>=2.5,<2.14
 numpy
 # LiteRT Torch (formerly AI Edge Torch); brings ai-edge-litert (runtime, also
-# used by the Kotlin tests) and ai-edge-quantizer (fp16 weights)
+# used by the Kotlin tests) and ai-edge-quantizer (optional fp16 weights)
 litert-torch==0.9.4
 # optional, for reference_pipeline.py --quality: pesq
