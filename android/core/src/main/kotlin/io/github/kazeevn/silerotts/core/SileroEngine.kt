@@ -97,9 +97,12 @@ class SileroEngine(assets: AssetSource, loader: NetworkLoader) : Closeable {
         return out.toString()
     }
 
-    /** Homograph resolution followed by the n-gram accentor (SileroStress.__call__). */
-    fun accentuate(cleanText: String, p: SynthesisParams): String {
-        val solved = homo.solve(cleanText, putStress = p.putStressHomo, putYo = p.putYoHomo)
+    /**
+     * Homograph resolution followed by the n-gram accentor (SileroStress.__call__).
+     * [left] / [right]: cleaned text around [cleanText], context for the homograph model.
+     */
+    fun accentuate(cleanText: String, p: SynthesisParams, left: String = "", right: String = ""): String {
+        val solved = homo.solve(cleanText, putStress = p.putStressHomo, putYo = p.putYoHomo, left = left, right = right)
         return accentor.accentuate(
             solved,
             Accentor.Options(
@@ -149,7 +152,7 @@ class SileroEngine(assets: AssetSource, loader: NetworkLoader) : Closeable {
         val maxLen = (MAX_CHUNK_CHARS * p.rate).toInt().coerceIn(MIN_CHUNK_CHARS, MAX_CHUNK_CHARS)
         val chunks = TextNormalizer.chunks(TextNormalizer.normalize(text), maxLen)
         for (chunk in chunks) {
-            if (!synthesizeChunk(chunk.text, p, sink, chunk.sentence)) return false
+            if (!synthesizeChunk(chunk.text, p, sink, chunk.sentence, chunk.left, chunk.right)) return false
             if (chunk.pauseAfterMs > 0) {
                 val silence = FloatArray(p.sampleRate * chunk.pauseAfterMs / 1000)
                 if (!sink.write(silence, silence.size)) return false
@@ -162,18 +165,27 @@ class SileroEngine(assets: AssetSource, loader: NetworkLoader) : Closeable {
      * Synthesizes one chunk (a sentence or a part of it).
      * @param text raw chunk text (after [TextNormalizer]).
      * @param typeText text used for intonation classification (defaults to [text]).
+     * @param left raw text before the chunk, context for the homograph model.
+     * @param right raw text after the chunk, context for the homograph model.
      * @return false if the sink aborted.
      */
-    fun synthesizeChunk(text: String, p: SynthesisParams, sink: AudioSink, typeText: String = text): Boolean {
+    fun synthesizeChunk(
+        text: String,
+        p: SynthesisParams,
+        sink: AudioSink,
+        typeText: String = text,
+        left: String = "",
+        right: String = "",
+    ): Boolean {
         val t0 = System.nanoTime()
         val stats = lastStats
         stats.firstAudioMs = 0.0
         val cleanText = clean(text)
         if (!hasSpeech(cleanText)) return true
         val spk = config.speakers[p.speaker] ?: config.speakers.values.first()
-        val accented = accentuate(cleanText, p)
+        val accented = accentuate(cleanText, p, clean(left), clean(right))
         val tokens = tokens(accented)
-        if (tokens.size > config.textSizes.max) return synthesizeHalves(text, p, sink, typeText)
+        if (tokens.size > config.textSizes.max) return synthesizeHalves(text, p, sink, typeText, left, right)
         val typeIds = SentenceType.typeIds(typeText, tokens.size)
         val t1 = System.nanoTime()
         stats.frontendMs = (t1 - t0) / 1e6
@@ -198,7 +210,7 @@ class SileroEngine(assets: AssetSource, loader: NetworkLoader) : Closeable {
         )
         val durs = durations(encoded.getValue("log_dur"), n, p.rate.coerceIn(0.2f, 4f))
         val total = durs.sum()
-        if (total > config.decoderSizes.max) return synthesizeHalves(text, p, sink, typeText)
+        if (total > config.decoderSizes.max) return synthesizeHalves(text, p, sink, typeText, left, right)
         val t2 = System.nanoTime()
         stats.textMs = (t2 - t1) / 1e6
 
@@ -225,14 +237,16 @@ class SileroEngine(assets: AssetSource, loader: NetworkLoader) : Closeable {
     }
 
     /** Fallback for chunks too long for the largest signature: synthesize the halves. */
-    private fun synthesizeHalves(text: String, p: SynthesisParams, sink: AudioSink, typeText: String): Boolean {
+    private fun synthesizeHalves(text: String, p: SynthesisParams, sink: AudioSink, typeText: String, left: String, right: String): Boolean {
         val mid = text.length / 2
         var cut = text.lastIndexOf(' ', mid)
         if (cut <= 0) cut = text.indexOf(' ', mid)
         if (cut <= 0) cut = mid
         require(cut in 1 until text.length) { "cannot split \"$text\"" }
-        return synthesizeChunk(text.substring(0, cut), p, sink, typeText) &&
-            synthesizeChunk(text.substring(cut), p, sink, typeText)
+        val head = text.substring(0, cut)
+        val tail = text.substring(cut)
+        return synthesizeChunk(head, p, sink, typeText, left, "$tail $right") &&
+            synthesizeChunk(tail, p, sink, typeText, "$left $head", right)
     }
 
     /**

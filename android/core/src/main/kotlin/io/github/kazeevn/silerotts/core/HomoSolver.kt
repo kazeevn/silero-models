@@ -176,7 +176,21 @@ class HomoSolver(
 
     private fun isWordChar(c: Char) = c in 'а'..'я' || c in 'А'..'Я' || c == 'ё' || c == 'Ё' || c == STRESS
 
-    fun solve(sentence: String, putStress: Boolean = true, putYo: Boolean = true, stressSingleVowel: Boolean = true): String {
+    /**
+     * Picks the readings of the homographs in [sentence]. [left] and [right]
+     * are the (cleaned) text around it: BERT sees them as context, but only
+     * the words of [sentence] are resolved. The original package resolves the
+     * whole input text at once; the engine synthesizes it sentence by sentence
+     * and passes the neighbouring text here instead.
+     */
+    fun solve(
+        sentence: String,
+        putStress: Boolean = true,
+        putYo: Boolean = true,
+        stressSingleVowel: Boolean = true,
+        left: String = "",
+        right: String = "",
+    ): String {
         if (!(putStress || putYo)) return sentence
         data class Found(val start: Int, val end: Int, val word: String, val ids: IntArray, val marker: Int, val markerEnd: Int)
         val found = ArrayList<Found>()
@@ -191,12 +205,13 @@ class HomoSolver(
             while (j < sentence.length && isWordChar(sentence[j])) j++
             val word = sentence.substring(i, j)
             if (word.lowercase() in homodict) {
-                var tok = tokenizer.encode(sentence.substring(0, i) + " ${BertTokenizer.HOMO} " + word + " ${BertTokenizer.HOMO_END} " + sentence.substring(j))
+                val marked = sentence.substring(0, i) + " ${BertTokenizer.HOMO} " + word + " ${BertTokenizer.HOMO_END} " + sentence.substring(j)
+                var tok = tokenizer.encode(listOf(left, marked, right).filter { it.isNotEmpty() }.joinToString(" "))
                 var s = tok.indexOf(ids.homoStart)
                 var e = tok.indexOf(ids.homoEnd)
                 if (tok.size > ids.maxLen) {
-                    // keep a window around the homograph (the original has no limit, our
-                    // chunks never get here in practice)
+                    // keep a window of the context around the homograph (the original
+                    // has no limit, but BERT has 512 positions)
                     val inner = ids.maxLen - 2
                     val from = (s - inner / 2).coerceIn(1, tok.size - 1 - inner)
                     tok = intArrayOf(ids.cls) + tok.copyOfRange(from, from + inner) + intArrayOf(ids.sep)

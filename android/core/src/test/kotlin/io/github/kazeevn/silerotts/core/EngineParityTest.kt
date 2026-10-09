@@ -36,14 +36,16 @@ class EngineParityTest {
                         rate = (c["rate"] as Number).toFloat(),
                         pitch = (c["pitch"] as Number).toFloat(),
                     )
+                    val left = c["left"] as String? ?: ""
+                    val right = c["right"] as String? ?: ""
                     val clean = engine.clean(text)
-                    val accented = engine.accentuate(clean, p)
+                    val accented = engine.accentuate(clean, p, engine.clean(left), engine.clean(right))
                     assertEquals(c["accented"], accented, "accented text of case $i")
                     val tokens = engine.tokens(accented)
                     assertEquals((c["tokens"] as List<*>).map { (it as Number).toInt() }, tokens.toList(), "tokens of case $i")
 
                     val audio = ArrayList<Float>()
-                    engine.synthesizeChunk(text, p, { buf, n -> for (k in 0 until n) audio.add(buf[k]); true })
+                    engine.synthesizeChunk(text, p, { buf, n -> for (k in 0 until n) audio.add(buf[k]); true }, left = left, right = right)
                     val ref = (c["audio"] as List<*>).map { (it as Number).toFloat() }
                     assertEquals(ref.size, audio.size, "audio length of case $i")
                     var num = 0.0

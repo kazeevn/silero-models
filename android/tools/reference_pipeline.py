@@ -380,7 +380,8 @@ class HomoSolver:
                            start=np.array([start], np.int32), end=np.array([end], np.int32))
         return out['logit'][0]
 
-    def __call__(self, sentence, put_stress=True, put_yo=True, stress_single_vowel=True):
+    def __call__(self, sentence, put_stress=True, put_yo=True, stress_single_vowel=True, left='', right=''):
+        """left / right: cleaned text around the sentence, BERT context only (mirrors HomoSolver.kt)."""
         if not (put_stress or put_yo):
             return sentence
         found = []
@@ -389,7 +390,8 @@ class HomoSolver:
             s, e = m.span()
             w = m.group()
             if w.lower() in self.homodict:
-                ids = self.tok(sentence[:s] + ' [HOMO] ' + w + ' [/HOMO] ' + sentence[e:])
+                marked = sentence[:s] + ' [HOMO] ' + w + ' [/HOMO] ' + sentence[e:]
+                ids = self.tok(' '.join(x for x in (left, marked, right) if x))
                 st, en = ids.index(self.cfg['homo_start']), ids.index(self.cfg['homo_end'])
                 if len(ids) > max_len:
                     # keep a window around the homograph (mirrors HomoSolver.kt)
@@ -534,8 +536,8 @@ class Pipeline:
         text = ''.join(c for c in text if c in allowed)
         return re.sub(r'\s+', ' ', text).strip()
 
-    def accentuate(self, text):
-        t = self.homo(text)
+    def accentuate(self, text, left='', right=''):
+        t = self.homo(text, left=left, right=right)
         return self.acc(t)
 
     def durations(self, log_dur, rate):
@@ -559,8 +561,8 @@ class Pipeline:
         c = np.float32(1.0 if coef == 0 else coef)
         return np.float32(coef), (c - np.float32(1)) * np.float32(self.cfg['mean_std_coef'][speaker_id])
 
-    def mel(self, raw_text, speaker='xenia', rate=1.0, pitch=1.0):
-        text = self.accentuate(self.clean(raw_text))
+    def mel(self, raw_text, speaker='xenia', rate=1.0, pitch=1.0, left='', right=''):
+        text = self.accentuate(self.clean(raw_text), self.clean(left), self.clean(right))
         seq = '|' + text + '~'
         tokens = np.array([self.sym[c] for c in seq], np.int32)
         L = len(tokens)
@@ -618,8 +620,8 @@ class Pipeline:
         y = (x[idx] * h[None, :]).sum(1)
         return y
 
-    def __call__(self, raw_text, speaker='xenia', sr=24000, rate=1.0, pitch=1.0):
-        text, tokens, durs, mel = self.mel(raw_text, speaker, rate, pitch)
+    def __call__(self, raw_text, speaker='xenia', sr=24000, rate=1.0, pitch=1.0, left='', right=''):
+        text, tokens, durs, mel = self.mel(raw_text, speaker, rate, pitch, left, right)
         audio = self.downsample(self.istft(*self.spectrum(mel)), sr)
         if np.abs(audio).max() > 1:
             audio = np.clip(audio, -1, 1)
@@ -639,6 +641,16 @@ TEST_TEXTS = [
     'Все мои знакомые уже давно переехали в другой город.',
     'Он вышел из комнаты и закрыл за собой дверь — тихо, без единого звука…',
     'Ёжик в тумане шёл по тропинке: медленно; осторожно.',
+]
+
+# (left, sentence, right): homographs resolved with the text around the sentence
+# as BERT context; the last case exceeds 512 wordpieces and exercises the window
+CONTEXT_CASES = [
+    ('Мы долго поднимались по горной дороге к старой крепости.', 'Замок был виден издалека.',
+     'Его башни возвышались над долиной.'),
+    ('Я потерял ключи от квартиры.', 'Пришлось ломать замок.', 'Слесарь приехал только к вечеру.'),
+    (' '.join(['Рыцари короля собирались в большом зале.'] * 60), 'Замок готовился к осаде.',
+     ' '.join(['Над стенами развевались знамёна.'] * 60)),
 ]
 
 
@@ -725,6 +737,13 @@ def main():
             cases.append({'text': text, 'speaker': spk, 'rate': rate, 'pitch': pitch, 'sample_rate': 24000,
                           'accented': out['text'], 'tokens': out['tokens'].tolist(), 'durs': out['durs'].tolist(),
                           'audio': [round(float(x), 6) for x in a]})
+        for i, (left, text, right) in enumerate(CONTEXT_CASES):
+            spk = speakers[i % len(speakers)]
+            out = pipe(text, spk, 24000, left=left, right=right)
+            print('context:', out['text'], '| without:', pipe.accentuate(pipe.clean(text)))
+            cases.append({'text': text, 'left': left, 'right': right, 'speaker': spk, 'rate': 1.0, 'pitch': 1.0,
+                          'sample_rate': 24000, 'accented': out['text'], 'tokens': out['tokens'].tolist(),
+                          'durs': out['durs'].tolist(), 'audio': [round(float(x), 6) for x in out['audio']]})
         with open(args.vectors, 'w', encoding='utf-8') as f:
             json.dump(cases, f, ensure_ascii=False)
         print(f'wrote {len(cases)} cases to {args.vectors}')

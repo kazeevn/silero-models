@@ -146,7 +146,13 @@ Android speech rate and pitch sliders are honoured; voices are exposed as
 * SSML is not supported (Android passes plain text); sentence pauses come
   from the model's punctuation handling and paragraph breaks add 250 ms.
 * Each sentence is synthesized separately (the original takes the whole text
-  at once), so stress/homograph context does not cross sentence boundaries.
+  at once). Homographs are still resolved with the surrounding text of the
+  request as BERT context (up to 2000 characters on either side, of which the
+  model sees a 512-wordpiece window centered on the homograph), like the
+  original; the n-gram accentor only looks at single words anyway. Context
+  never crosses TTS requests: apps that send one sentence per request (e.g.
+  TalkBack) get sentence context only, book readers that send a page or
+  paragraph get the whole of it.
 * Peaks above full scale are hard-limited instead of `tanh` soft-clipping the
   whole utterance, which is impossible when streaming.
 

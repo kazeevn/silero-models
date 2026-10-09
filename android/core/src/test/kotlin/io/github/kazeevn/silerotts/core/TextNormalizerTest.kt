@@ -97,4 +97,19 @@ class TextNormalizerTest {
         assert(parts.size > 3)
         assert(parts.all { it.sentence == parts[0].sentence })
     }
+
+    @Test
+    fun chunkContext() {
+        val text = "Первое предложение. Второе предложение?\nНовый абзац без точки"
+        val chunks = TextNormalizer.chunks(TextNormalizer.normalize(text))
+        assertEquals(listOf("", "Первое предложение.", "Первое предложение. Второе предложение?"), chunks.map { it.left })
+        assertEquals(listOf("Второе предложение? Новый абзац без точки.", "Новый абзац без точки.", ""), chunks.map { it.right })
+
+        // long context is cut to whole words within CONTEXT_CHARS
+        val filler = (1..400).joinToString(" ") { "слово$it" }
+        val long = TextNormalizer.chunks("$filler. Средняя фраза. $filler.").first { it.text == "Средняя фраза." }
+        assert(long.left.length <= TextNormalizer.CONTEXT_CHARS && long.left.endsWith("слово400.")) { long.left }
+        assert(long.left.startsWith("слово")) { long.left }
+        assert(long.right.length <= TextNormalizer.CONTEXT_CHARS && long.right.startsWith("слово1 ")) { long.right }
+    }
 }
