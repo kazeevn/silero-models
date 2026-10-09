@@ -386,15 +386,7 @@ object TextNormalizer {
     }
 
     /** A synthesis unit: a sentence (or a part of a long one). */
-    /**
-     * A piece of text synthesized at once. [left] and [right] are the text
-     * around it (up to [CONTEXT_CHARS] each, cut at a word boundary), used as
-     * context for the homograph model.
-     */
-    data class Chunk(val text: String, val sentence: String, val pauseAfterMs: Int, val left: String = "", val right: String = "")
-
-    /** Enough for the 512-wordpiece BERT window (centered on the homograph, or one-sided at the ends of the text). */
-    const val CONTEXT_CHARS = 2000
+    data class Chunk(val text: String, val sentence: String, val pauseAfterMs: Int)
 
     private val SENTENCE_END = Regex("(?<=[.!?…])\\s+")
 
@@ -417,18 +409,7 @@ object TextNormalizer {
                 }
             }
         }
-        val joined = out.joinToString(" ") { it.text }
-        var start = 0
-        return out.map { c ->
-            val end = start + c.text.length
-            val before = joined.substring(0, maxOf(0, start - 1))
-            val after = joined.substring(minOf(joined.length, end + 1))
-            start = end + 1
-            c.copy(
-                left = if (before.length > CONTEXT_CHARS) before.takeLast(CONTEXT_CHARS).substringAfter(' ', "") else before,
-                right = if (after.length > CONTEXT_CHARS) after.take(CONTEXT_CHARS).substringBeforeLast(' ', "") else after,
-            )
-        }
+        return out
     }
 
     private fun splitLong(s: String, maxLen: Int): List<String> {

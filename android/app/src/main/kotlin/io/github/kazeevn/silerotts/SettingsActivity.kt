@@ -146,7 +146,7 @@ class SettingsActivity : Activity() {
                     var firstAudio = 0.0
                     val t0 = SystemClock.elapsedRealtimeNanos()
                     for ((i, c) in chunks.withIndex()) {
-                        engine.synthesizeChunk(c.text, params, { _, _ -> true }, c.sentence, c.left, c.right)
+                        engine.synthesizeChunk(c.text, params, { _, _ -> true }, c.sentence)
                         val s = engine.lastStats
                         if (i == 0) firstAudio = s.firstAudioMs
                         audio += s.audioSeconds

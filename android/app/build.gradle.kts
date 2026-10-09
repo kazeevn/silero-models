@@ -16,8 +16,8 @@ android {
         // built for a Pixel 8a running Android 17
         minSdk = 37
         targetSdk = 37
-        versionCode = 3
-        versionName = "2.1.0-v5_5_ru"
+        versionCode = 4
+        versionName = "2.1.1-v5_5_ru"
         // Tensor G3 is arm64-only; drop the other ABIs of the LiteRT runtime
         // (-Psilero.abi=x86_64 builds an APK for smoke tests on the emulator)
         ndk { abiFilters += (findProperty("silero.abi") ?: "arm64-v8a").toString() }
